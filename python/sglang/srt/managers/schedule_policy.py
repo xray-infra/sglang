@@ -446,6 +446,49 @@ class SchedulePolicy:
         )
 
     @staticmethod
+    def _uncached_len(r: Req) -> int:
+        """Number of tokens that must actually be prefilled for this req
+        (including generated history after retraction, with all cache levels
+        — device + host via hicache — counted as cached)."""
+        return max(0, r.seqlen - r.num_matched_prefix_tokens)
+
+    @staticmethod
+    def _sort_by_hrrn(
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        processed_tokens: int,
+    ) -> None:
+        """Highest Response Ratio Next, with token-based aging.
+
+        Equivalence with classic HRRN when throughput is constant:
+            ratio = 1 + wait_sec / est_prefill_time
+                  = 1 + (processed_tokens - arrival_processed_tokens) / uncached
+
+        Caller (Scheduler) contract:
+          - Maintain a monotonically increasing counter of prefill tokens processed so far
+            (accumulate batch.extend_num_tokens per forward). Pass it in as `processed_tokens`.
+          - Snapshot `req.arrival_processed_tokens = counter` when the req enters waiting_queue
+            (pop_bootstrapped for disagg prefill, _add_request_to_queue for unified).
+
+        Call sites that omit `processed_tokens` (dllm, disagg decode)
+        degrade to rid-lexicographic order; those queues carry no prefill work.
+        """
+
+        def _key(r: Req):
+            rid = r.rid
+            if rid in temporary_deprioritized:
+                return (float("inf"), rid)
+            uncached = SchedulePolicy._uncached_len(r)
+            if uncached <= 0:
+                # No prefill work; drain immediately.
+                return (-float("inf"), rid)
+            waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
+            ratio_delta = waited_tokens / uncached
+            return (-ratio_delta, rid)
+
+        waiting_queue.sort(key=_key)
+
+    @staticmethod
     def _sort_by_dfs_weight(
         waiting_queue: List[Req], tree_cache: BasePrefixCache
     ) -> None:
