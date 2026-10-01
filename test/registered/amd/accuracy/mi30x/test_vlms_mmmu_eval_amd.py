@@ -41,6 +41,8 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=7200, suite="nightly-amd-accuracy-2-gpu-vlm", nightly=True)
 
 # AMD-verified VLM models with conservative thresholds on 100 MMMU samples
+# Thresholds are the lowest score across rocm720/rocm724/rocm10 with the
+# 1024-token CoT budget, minus 0.05, and never lower than the previous value.
 # Format: (model_path, tp_size, accuracy_threshold, extra_args)
 AMD_VLM_MODELS = [
     # Qwen VL series - well supported on AMD
@@ -53,13 +55,13 @@ AMD_VLM_MODELS = [
     {
         "model_path": "Qwen/Qwen2.5-VL-7B-Instruct",
         "tp_size": 1,
-        "accuracy_threshold": 0.33,
+        "accuracy_threshold": 0.45,
         "extra_args": ["--trust-remote-code"],
     },
     {
         "model_path": "Qwen/Qwen3-VL-30B-A3B-Instruct",
         "tp_size": 2,
-        "accuracy_threshold": 0.29,
+        "accuracy_threshold": 0.40,
         "extra_args": ["--trust-remote-code"],
     },
     # InternVL2 - smaller model, good for testing
@@ -73,20 +75,20 @@ AMD_VLM_MODELS = [
     {
         "model_path": "openbmb/MiniCPM-v-2_6",
         "tp_size": 1,
-        "accuracy_threshold": 0.25,
+        "accuracy_threshold": 0.35,
         "extra_args": ["--trust-remote-code"],
     },
     {
         "model_path": "openbmb/MiniCPM-o-2_6",
         "tp_size": 1,
-        "accuracy_threshold": 0.32,
+        "accuracy_threshold": 0.42,
         "extra_args": ["--trust-remote-code"],
     },
     # DeepSeek VL series
     {
         "model_path": "deepseek-ai/deepseek-vl2-small",
         "tp_size": 1,
-        "accuracy_threshold": 0.31,
+        "accuracy_threshold": 0.38,
         "extra_args": ["--trust-remote-code"],
     },
     {
@@ -99,14 +101,14 @@ AMD_VLM_MODELS = [
     {
         "model_path": "moonshotai/Kimi-VL-A3B-Instruct",
         "tp_size": 1,
-        "accuracy_threshold": 0.26,
+        "accuracy_threshold": 0.40,
         "extra_args": ["--trust-remote-code"],
     },
     # MiMo VL
     {
         "model_path": "XiaomiMiMo/MiMo-VL-7B-RL",
         "tp_size": 1,
-        "accuracy_threshold": 0.27,
+        "accuracy_threshold": 0.42,
         "extra_args": ["--trust-remote-code"],
     },
     # GLM VL
