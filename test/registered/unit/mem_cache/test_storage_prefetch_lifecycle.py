@@ -566,7 +566,9 @@ class TestPrefetchAttemptMetadataCleanup(CustomTestCase):
         self.assertEqual(self.cache.pop_prefetch_loaded_span(handle), (0, None))
         self.assertNotIn(handle, self.cache.ongoing_prefetch)
         self.assertEqual(self.cache.cache_controller.prefetch_tokens_occupied, 0)
-        self.cache.cache_controller.terminate_prefetch.assert_called_once_with(operation)
+        self.cache.cache_controller.terminate_prefetch.assert_called_once_with(
+            operation
+        )
         self.cache.cache_controller.append_host_mem_release.assert_called_once_with(
             extra_pools=[]
         )
