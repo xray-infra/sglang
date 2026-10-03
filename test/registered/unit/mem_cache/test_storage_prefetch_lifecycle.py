@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
+    CacheRequestOutcome,
     InitLoadBackParams,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
@@ -31,6 +32,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 )
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -492,6 +494,91 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         retries = cache.storage_prefetch_retries
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [])
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [(req, None)])
+
+
+class TestPrefetchAttemptMetadataCleanup(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        self.cache.linker = None
+        self.cache.buffer_pipeline = None
+        self.cache.host_memory_mode = "cache"
+        self.cache.storage_prefetch_retries = Mock()
+        self.cache.ongoing_prefetch = {}
+        self.cache._storage_prefetch_hit_remaining_by_reqid = {}
+        self.cache.prefetch_loaded_tokens_by_reqid = {}
+        self.cache.prefetch_loaded_storage_start_by_reqid = {}
+        self.cache.cache_controller = Mock(prefetch_tokens_occupied=0)
+
+    def _record_loaded_span(self, handle, tokens=6, storage_start=2):
+        self.cache.prefetch_loaded_tokens_by_reqid[handle] = tokens
+        self.cache.prefetch_loaded_storage_start_by_reqid[handle] = storage_start
+
+    def test_abort_after_host_commit_removes_loaded_span(self):
+        # Host commit has retired the operation, but admission has not popped
+        # the loaded span when the queued request is aborted.
+        handle = CacheRequestHandle("committed", 0)
+        self._record_loaded_span(handle)
+
+        self.cache.finish(handle, CacheRequestOutcome.ABORT)
+
+        self.assertNotIn(handle, self.cache.prefetch_loaded_tokens_by_reqid)
+        self.assertNotIn(handle, self.cache.prefetch_loaded_storage_start_by_reqid)
+        self.assertEqual(self.cache.pop_prefetch_loaded_span(handle), (0, None))
+        self.cache.cache_controller.terminate_prefetch.assert_not_called()
+        self.cache.cache_controller.append_host_mem_release.assert_not_called()
+
+    def test_abort_preserves_other_attempt_with_same_rid(self):
+        cancelled = CacheRequestHandle("shared-rid", 0)
+        other = CacheRequestHandle("shared-rid", 1)
+        self._record_loaded_span(cancelled)
+        self._record_loaded_span(other, tokens=8, storage_start=4)
+
+        self.cache.finish(cancelled, CacheRequestOutcome.ABORT)
+
+        self.assertEqual(self.cache.pop_prefetch_loaded_span(cancelled), (0, None))
+        self.assertEqual(self.cache.pop_prefetch_loaded_span(other), (8, 4))
+
+    def test_repeated_abort_without_ongoing_is_idempotent(self):
+        handle = CacheRequestHandle("repeated", 0)
+        self._record_loaded_span(handle)
+
+        self.cache.finish(handle, CacheRequestOutcome.ABORT)
+        self.cache.finish(handle, CacheRequestOutcome.ABORT)
+
+        self.assertEqual(self.cache.prefetch_loaded_tokens_by_reqid, {})
+        self.assertEqual(self.cache.prefetch_loaded_storage_start_by_reqid, {})
+        self.cache.cache_controller.terminate_prefetch.assert_not_called()
+        self.cache.cache_controller.append_host_mem_release.assert_not_called()
+
+    def test_abort_with_pending_prefetch_cleans_metadata_and_revokes(self):
+        handle = CacheRequestHandle("pending", 0)
+        self._record_loaded_span(handle)
+        operation = SimpleNamespace(host_indices=None)
+        key = RadixKey(array("q", range(6)))
+        self.cache.ongoing_prefetch[handle] = _OngoingPrefetch(
+            0, key, None, operation, None, {}
+        )
+        self.cache.cache_controller.prefetch_tokens_occupied = len(key)
+
+        self.cache.finish(handle, CacheRequestOutcome.ABORT)
+
+        self.assertEqual(self.cache.pop_prefetch_loaded_span(handle), (0, None))
+        self.assertNotIn(handle, self.cache.ongoing_prefetch)
+        self.assertEqual(self.cache.cache_controller.prefetch_tokens_occupied, 0)
+        self.cache.cache_controller.terminate_prefetch.assert_called_once_with(
+            operation
+        )
+        self.cache.cache_controller.append_host_mem_release.assert_called_once_with(
+            extra_pools=[]
+        )
+
+    def test_pop_loaded_span_consumes_attempt_metadata(self):
+        handle = CacheRequestHandle("consumed", 0)
+        self._record_loaded_span(handle)
+
+        self.assertEqual(self.cache.pop_prefetch_loaded_span(handle), (6, 2))
+        self.assertEqual(self.cache.pop_prefetch_loaded_span(handle), (0, None))
 
 
 if __name__ == "__main__":
