@@ -172,7 +172,9 @@ class MooncakeJointCandidateTest(unittest.TestCase):
                     "global_segment_size": 64 << 20,
                     "protocol": "tcp", "device_name": "",
                     "master_server_address": f"127.0.0.1:{rpc_port}",
-                    "master_metrics_port": metrics_port, "check_server": True,
+                    # Fresh master has no segments until normal setup below.
+                    # Strict native /health above is the startup readiness gate.
+                    "master_metrics_port": metrics_port, "check_server": False,
                     "standalone_storage": False,
                     "extra_backend_tag": f"joint-{uuid.uuid4().hex}",
                 },
