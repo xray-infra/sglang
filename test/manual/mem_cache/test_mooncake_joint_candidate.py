@@ -103,15 +103,22 @@ class MooncakeJointCandidateTest(unittest.TestCase):
                     self.assertIsNone(master.poll(), f"Master exited; see {log_path}")
                     try:
                         response = session.get(
-                            f"http://127.0.0.1:{metrics_port}/get_all_segments", timeout=1
+                            f"http://127.0.0.1:{metrics_port}/health", timeout=1
                         )
                         response.raise_for_status()
-                        response.json()
-                        break
+                        health = response.json()
+                        evidence["master_health"] = health
+                        if (
+                            isinstance(health, dict)
+                            and health.get("status") == "ok"
+                            and health.get("service_ready") is True
+                        ):
+                            break
                     except (requests.RequestException, ValueError):
-                        if time.monotonic() >= deadline:
-                            self.fail(f"Master HTTP readiness timed out; see {log_path}")
-                        time.sleep(0.05)
+                        pass
+                    if time.monotonic() >= deadline:
+                        self.fail(f"Master HTTP readiness timed out; see {log_path}")
+                    time.sleep(0.05)
 
             device_pool = MHATokenToKVPool(
                 size=64,
