@@ -115,4 +115,9 @@ class UnifiedSessionRefTracker:
             session_id,
             indexed,
         )
-        return 0
+        # Return the actual number of component leaves released.  The
+        # scheduler-facing cache API exposes this value so callers can account
+        # for a close operation; returning a constant zero hid successful
+        # releases and made cache-lifecycle accounting indistinguishable from
+        # an unknown/already-closed session.
+        return indexed

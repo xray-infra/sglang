@@ -119,7 +119,17 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         register(self.cache, [1, 2, 3, 4], "s1", generation)
         self.assertEqual(self.full.session_ref(leaf), 1)
 
-        self.cache.release_radix_session("s1")
+        self.assertEqual(self.cache.release_radix_session("s1"), 1)
+        self.assertEqual(self.full.session_ref(leaf), 0)
+
+    def test_releasing_unknown_or_closed_session_reports_zero(self):
+        self.assertEqual(self.cache.release_radix_session("missing"), 0)
+
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        self.assertEqual(self.cache.release_radix_session("s1"), 1)
+        self.assertEqual(self.cache.release_radix_session("s1"), 0)
         self.assertEqual(self.full.session_ref(leaf), 0)
 
     def test_reopen_rejects_stale_generation(self):
