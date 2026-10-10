@@ -70,7 +70,7 @@ dependencies = [
   "uvicorn",
   "xxhash",
   "uvloop",
-  # "xgrammar==0.2.8+qwen.numeric2", xgrammar depends on CUDA PyTorch and Triton only
+  # "xgrammar==0.2.8+xray.1", xgrammar depends on CUDA PyTorch and Triton only
 ]
 
 [project.optional-dependencies]
