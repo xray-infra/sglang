@@ -141,6 +141,12 @@ class _PendingOffload(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
+class _PendingLoad(NamedTuple):
+    node_id: NodeId
+    lock_params: DecLockRefParams
+    until_node_id: NodeId | None
+
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
@@ -173,7 +179,7 @@ class UnifiedCacheLinkerWrapper:
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA completes.
-        self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
+        self.pending_loads: dict[str, _PendingLoad] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
 
@@ -385,15 +391,21 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
-        self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
-
-        cache.tree_core.mark_external_cache_stored_path(
-            insert_result.last_device_node, req.last_node
+        self._queue_load(
+            req.rid,
+            insert_result.last_device_node,
+            load_transfers,
+            until_node_id=req.last_node,
         )
         return canonical_tail, insert_result.last_device_node
 
     def _queue_load(
-        self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]
+        self,
+        rid: str,
+        node_id: NodeId,
+        transfers: list[PoolTransfer],
+        *,
+        until_node_id: NodeId | None = None,
     ) -> None:
         if not transfers:
             return
@@ -407,7 +419,7 @@ class UnifiedCacheLinkerWrapper:
         if not queued:
             self.cache.dec_lock_ref(node_id, lock_params)
             raise RuntimeError(f"Failed to queue the linker load for rid={rid!r}.")
-        self.pending_loads[rid] = (node_id, lock_params)
+        self.pending_loads[rid] = _PendingLoad(node_id, lock_params, until_node_id)
 
     def _update_load(
         self,
@@ -555,8 +567,14 @@ class UnifiedCacheLinkerWrapper:
     def drain_loads(self, finish_count: int) -> None:
         for _ in range(finish_count):
             for rid in self.cache_linker.pop_completed_load():
-                node_id, lock_params = self.pending_loads.pop(rid)
-                self.cache.dec_lock_ref(node_id, lock_params)
+                pending = self.pending_loads.pop(rid)
+                try:
+                    if pending.until_node_id is not None:
+                        self.cache.tree_core.mark_external_cache_stored_path(
+                            pending.node_id, pending.until_node_id
+                        )
+                finally:
+                    self.cache.dec_lock_ref(pending.node_id, pending.lock_params)
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
@@ -582,8 +600,8 @@ class UnifiedCacheLinkerWrapper:
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
-        for node_id, lock_params in self.pending_loads.values():
-            self.cache.dec_lock_ref(node_id, lock_params)
+        for pending in self.pending_loads.values():
+            self.cache.dec_lock_ref(pending.node_id, pending.lock_params)
         self.pending_loads.clear()
         for pending in self.pending_offloads:
             self.cache.tree_core.finish_external_linker_offload(
@@ -594,11 +612,9 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
-        # TODO: Roll back the published tree and component state atomically before
-        # canceling; otherwise the tree may retain device slots that were never loaded.
         if self.cache_linker.cancel_queued_load(rid):
-            node_id, lock_params = self.pending_loads.pop(rid)
-            self.cache.dec_lock_ref(node_id, lock_params)
+            pending = self.pending_loads.pop(rid)
+            self.cache.dec_lock_ref(pending.node_id, pending.lock_params)
 
     def close(self) -> None:
         self.cache_linker.close()
