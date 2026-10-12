@@ -5,15 +5,25 @@ substituted. Real DeepGEMM Tensor creation and GPU warmup need integration tests
 """
 
 import ast
+import importlib.util
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
-
 
 SOURCE = (
     Path(__file__).resolve().parents[5]
     / "python/sglang/srt/layers/attention/deepseek_v4_backend.py"
 )
+
+# Like the registry linter, load the actual CI marker without importing the
+# SGLang package and its GPU dependencies. The test remains stdlib-only.
+_ci_spec = importlib.util.spec_from_file_location(
+    "ci_register", SOURCE.parents[3] / "test/ci/ci_register.py"
+)
+_ci_register = importlib.util.module_from_spec(_ci_spec)
+_ci_spec.loader.exec_module(_ci_register)
+register_cpu_ci = _ci_register.register_cpu_ci
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def load_method(sm120):
