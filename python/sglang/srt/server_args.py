@@ -753,6 +753,7 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "shortest-prefill-first",
             ],
         ),
         NS("schedule"),

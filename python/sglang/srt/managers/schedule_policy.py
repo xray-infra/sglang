@@ -206,6 +206,7 @@ class CacheAwarePolicy(Enum):
 
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+    SHORTEST_PREFILL_FIRST = "shortest-prefill-first"
 
 
 class CacheAgnosticPolicy(Enum):
@@ -272,6 +273,10 @@ class SchedulePolicy:
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
+            elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+                SchedulePolicy._sort_by_shortest_prefill(
+                    waiting_queue, temporary_deprioritized
+                )
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -310,6 +315,8 @@ class SchedulePolicy:
         """
         Validates the policy and adjusts it if necessary based on tree cache settings.
         """
+        if policy == "shortest-prefill-first" and getattr(tree_cache, "disable", True):
+            raise ValueError("shortest-prefill-first requires prefix caching")
         try:
             policy_enum = CacheAwarePolicy(policy)
             if getattr(tree_cache, "disable", True):
@@ -380,6 +387,50 @@ class SchedulePolicy:
                         )
                     )
         return temporary_deprioritized
+
+    @staticmethod
+    def _shortest_prefill_work(req: Req) -> int:
+        return max(
+            1,
+            len(req.origin_input_ids)
+            + len(req.output_ids)
+            - req.num_matched_prefix_tokens,
+        )
+
+    @staticmethod
+    def _sort_by_shortest_prefill(
+        waiting_queue: List[Req], temporary_deprioritized: Set[int]
+    ) -> None:
+        waiting_queue.sort(
+            key=lambda req: (
+                req.rid in temporary_deprioritized,
+                SchedulePolicy._shortest_prefill_work(req),
+                req.time_stats.wait_queue_entry_time,
+            )
+        )
+
+    def shortest_prefill_chunk_limit(
+        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+    ) -> Optional[int]:
+        """Reserve page-aligned prefill capacity for shorter queued requests."""
+        if (
+            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            or budget < 2 * page_size
+        ):
+            return None
+        remaining = len(chunked_req.full_untruncated_fill_ids) - len(
+            chunked_req.prefix_indices
+        )
+        reserved = 0
+        for req in waiting_queue:
+            work = self._shortest_prefill_work(req)
+            charge = _ceil_div(work, page_size) * page_size
+            if work >= remaining or reserved + charge > budget - page_size:
+                break
+            reserved += charge
+        if not reserved:
+            return None
+        return (budget - reserved) // page_size * page_size
 
     @staticmethod
     def _sort_by_longest_prefix(
@@ -504,6 +555,7 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -1028,6 +1080,10 @@ class PrefillAdder:
                 max_running_requests=self.max_running_requests,
                 waiting_queue_len=self.waiting_queue_len,
             )
+
+        if self.chunked_req_limit is not None:
+            assert self.chunked_req_limit > 0
+            _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
