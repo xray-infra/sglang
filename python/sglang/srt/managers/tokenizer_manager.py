@@ -3484,6 +3484,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not hasattr(obj, "is_single") or obj.is_single:
             items = [(obj.rid, obj, getattr(obj, "bootstrap_room", None))]
         else:
+            # Parallel sampling dispatches only the original batch here; child
+            # states are created with new rids in _handle_batch_request.
+            num_originals = (
+                obj.batch_size
+                if getattr(obj, "parallel_sample_num", 1) > 1
+                else len(obj.rid)
+            )
             items = [
                 (
                     obj.rid[i],
@@ -3494,7 +3501,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         else None
                     ),
                 )
-                for i in range(len(obj.rid))
+                for i in range(num_originals)
             ]
 
         for rid, sub_obj, bootstrap_room in items:
