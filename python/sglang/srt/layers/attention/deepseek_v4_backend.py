@@ -1216,10 +1216,13 @@ class DeepseekV4AttnBackend(
             page_table=page_table,
             c4_seq_lens=c_seq_lens,
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
-            # The SM120 FP4 kernel schedules split_kv=128, while the generic
-            # JIT metadata planner encodes split_kv=256.
+            # Low-ratio sources always use FP4, independently of the c4 option.
+            # The SM120 FP4 kernel requires native scheduling metadata even
+            # when the ordinary FP8 path uses the Torch fallback; its split_kv
+            # is 128 rather than the generic JIT planner's 256.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
+                get_platform().is_sm120
+                and (compress_ratio in (1, 2) or self.enable_deepseek_v4_fp4_indexer)
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
