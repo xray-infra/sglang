@@ -1,0 +1,18 @@
+{
+  "srt/entrypoints/openai/protocol.py": {
+    "before": "35564db2a2d62f102d557dda4b66bae29d48a4b6a111f7c774bc684d2c37ede0",
+    "after": "cf3f896cd0e10405be8d76eb00d2a72a225f497bbfe2556bc4c27249b0a9429f"
+  },
+  "srt/entrypoints/openai/serving_chat.py": {
+    "before": "ff59e4e847f775be049a7f6ddf94915d60bb7e3e41116bccc679302d8d63475d",
+    "after": "640fb9875d8b060474df49004cee7f8c6ba2867f4f8ac33f6b9e0f50b6a06800"
+  },
+  "srt/entrypoints/openai/serving_completions.py": {
+    "before": "4cc02067c91dffa020b38133fc2ed667cf65ed45ac197ae0c8757af7e3016665",
+    "after": "740951e4e8fb57c0bd8ad754aab9e78753b6c0b002347961494132b5d26a1002"
+  },
+  "srt/entrypoints/openai/usage_processor.py": {
+    "before": "883c4c3ba95eb52fa57d5bf732d128063bac0b032f484776331220f61b7498a5",
+    "after": "c71b2e2b7ae3ae193172eae9f95f0b2d738053fcd43acc5610f8eb344bfe30ce"
+  }
+}

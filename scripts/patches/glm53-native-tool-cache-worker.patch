@@ -1,0 +1,176 @@
+--- a/python/sglang/srt/entrypoints/openai/protocol.py
++++ b/python/sglang/srt/entrypoints/openai/protocol.py
+@@ -189,9 +189,9 @@
+ 
+ 
+ class PromptTokensDetails(BaseModel):
+-    """Details about prompt tokens."""
+-
+-    cached_tokens: int = 0
++    """Details about prompt tokens; absent cache counts are unknown, not zero."""
++
++    cached_tokens: int | None = None
+     # Multimodal prompt token counts (only populated when present in the prompt)
+     image_tokens: Optional[int] = None
+     audio_tokens: Optional[int] = None
+@@ -200,9 +200,9 @@
+     @model_serializer(mode="wrap")
+     def _serialize(self, handler):
+         data = handler(self)
+-        # Drop multimodal fields when absent so text-only/cache-only responses
+-        # keep the original {"cached_tokens": N} shape.
+-        for key in ("image_tokens", "audio_tokens", "video_tokens"):
++        # Preserve known cache zero, but do not invent it for multimodal details.
++        # Cache-only responses keep the original {"cached_tokens": N} shape.
++        for key in ("cached_tokens", "image_tokens", "audio_tokens", "video_tokens"):
+             if data.get(key) is None:
+                 data.pop(key, None)
+         return data
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -815,7 +815,7 @@
+         if not get_serving().enable_cache_report:
+             return None
+         return UsageProcessor._details_if_cached(
+-            content["meta_info"].get("cached_tokens", 0)
++            content["meta_info"].get("cached_tokens")
+         )
+ 
+     def _reported_prompt_tokens(self, meta_info: dict[str, Any]) -> int:
+@@ -2196,7 +2196,7 @@
+                 reasoning_tokens[index] = content["meta_info"].get(
+                     "reasoning_tokens", 0
+                 )
+-                cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
++                cached_tokens[index] = content["meta_info"].get("cached_tokens")
+                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                 cached_tokens_details[index] = content["meta_info"].get(
+@@ -2799,9 +2799,11 @@
+                 tools,
+                 self.tool_call_parser,
+                 tokenizer=self.tokenizer_manager.tokenizer,
+-                tool_choice=tool_choice,
+-            )
+-            detector_owns_format = parser.owns_tool_format()
++            )
++            detector_owns_format = (
++                parser.detector.supports_structural_tag()
++                or parser.detector.parses_required_natively()
++            )
+             should_try_parser = not is_required or detector_owns_format
+             if should_try_parser and parser.has_tool_call(text):
+                 try:
+@@ -3253,9 +3255,11 @@
+                         tools=effective_tools,
+                         tool_call_parser=self.tool_call_parser,
+                         tokenizer=self.tokenizer_manager.tokenizer,
+-                        tool_choice=request.tool_choice,
+                     )
+-                    use_native_parser = probe.owns_tool_format()
++                    use_native_parser = (
++                        probe.detector.supports_structural_tag()
++                        or probe.detector.parses_required_natively()
++                    )
+                 if use_native_parser:
+                     parser_dict[index] = probe
+                 else:
+--- a/python/sglang/srt/entrypoints/openai/serving_completions.py
++++ b/python/sglang/srt/entrypoints/openai/serving_completions.py
+@@ -266,7 +266,7 @@
+                 reasoning_tokens[index] = content["meta_info"].get(
+                     "reasoning_tokens", 0
+                 )
+-                cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
++                cached_tokens[index] = content["meta_info"].get("cached_tokens")
+                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                 cached_tokens_details[index] = content["meta_info"].get(
+--- a/python/sglang/srt/entrypoints/openai/usage_processor.py
++++ b/python/sglang/srt/entrypoints/openai/usage_processor.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+-from typing import Any, Dict, List, Mapping, Optional, final
++from collections.abc import Iterable, Mapping
++from typing import Any, final
+ 
+ from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInfo
+ 
+@@ -10,13 +11,27 @@
+     """Stateless helpers that turn raw token counts into a UsageInfo."""
+ 
+     @staticmethod
+-    def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
+-        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
+-        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
++    def _details_if_cached(count: int | None) -> PromptTokensDetails | None:
++        """Report known nonnegative counts, including zero; never invent a miss."""
++        if count is None or count < 0:
++            return None
++        return PromptTokensDetails(cached_tokens=count)
++
++    @staticmethod
++    def _details_from_cached_counts(
++        counts: Iterable[int | None],
++    ) -> PromptTokensDetails | None:
++        """Only report a total when every contributing prompt count is known."""
++        total: int | None = None
++        for count in counts:
++            if count is None or count < 0:
++                return None
++            total = count if total is None else total + count
++        return UsageProcessor._details_if_cached(total)
+ 
+     @staticmethod
+     def calculate_response_usage(
+-        responses: List[Dict[str, Any]],
++        responses: list[dict[str, Any]],
+         n_choices: int = 1,
+         enable_cache_report: bool = False,
+         image_tokens: int = 0,
+@@ -38,11 +53,10 @@
+ 
+         cached_details = None
+         if enable_cache_report:
+-            cached_total = sum(
+-                responses[i]["meta_info"].get("cached_tokens", 0)
++            cached_details = UsageProcessor._details_from_cached_counts(
++                responses[i]["meta_info"].get("cached_tokens")
+                 for i in range(0, len(responses), n_choices)
+             )
+-            cached_details = UsageProcessor._details_if_cached(cached_total)
+ 
+         return UsageProcessor.calculate_token_usage(
+             prompt_tokens=prompt_tokens,
+@@ -59,7 +73,7 @@
+         prompt_tokens: Mapping[int, int],
+         reasoning_tokens: Mapping[int, int],
+         completion_tokens: Mapping[int, int],
+-        cached_tokens: Mapping[int, int],
++        cached_tokens: Mapping[int, int | None],
+         n_choices: int,
+         enable_cache_report: bool = False,
+         image_tokens: int = 0,
+@@ -74,8 +88,8 @@
+         total_completion_tokens = sum(completion_tokens.values())
+ 
+         cached_details = (
+-            UsageProcessor._details_if_cached(
+-                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
++            UsageProcessor._details_from_cached_counts(
++                cached_tokens.get(idx) for idx in prompt_tokens if idx % n_choices == 0
+             )
+             if enable_cache_report
+             else None
+@@ -95,8 +109,8 @@
+     def calculate_token_usage(
+         prompt_tokens: int,
+         completion_tokens: int,
+-        reasoning_tokens: Optional[int] = 0,
+-        cached_tokens: Optional[PromptTokensDetails] = None,
++        reasoning_tokens: int | None = 0,
++        cached_tokens: PromptTokensDetails | None = None,
+         image_tokens: int = 0,
+         audio_tokens: int = 0,
+         video_tokens: int = 0,
