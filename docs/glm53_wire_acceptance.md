@@ -199,40 +199,19 @@ rollback/canary boundaries. Source checks, GPU patch qualification, public-matri
 qualification and explicit production-change authorization are all required before
 rollout; none is replaced by the CPU result above.
 
-## L3 namespace follow-up (2026-10-12; not accepted for rollout)
+## Verified single-worker wire acceptance (2026-10-12)
 
-The captured worker's DCP retention and shared-read callers used `get_hash_str`,
-while actual HiCache writes use `get_storage_hash_str`, including the
-`extra_key`/`cache_salt` namespace seed. A correlated fresh 5m request showed
-identical DCP namespaces but different reserved/storage page roots on all eight
-ranks, `retained_owners=0`, absent ACKs and master commit error `-703`.
+The bounded four-file worker backport was deployed to node58. Native OpenAI
+12/12, same-image single-worker frontend OpenAI 12/12 and Anthropic 12/12
+passed: ordinary and auto/required-or-any/named tools, JSON/SSE, valid tool
+IDs/names/arguments and completion reasons, no stream error, and final usage.
+Both frontend protocols reported real cold-cache zero and repeated-prefix
+4608-token hits. No external weather tool was executed. These 36 cases prove
+the single-worker interface matrix, not public full-pool acceptance.
 
-The minimal live-overlay delta is
-`scripts/patches/glm53-native-retention-storage-hash-worker.patch`; its adjacent
-hash manifest pins the original and candidate bytes of both overlay modules.
-Those modules are absent from this repository baseline: this is a bounded
-worker backport, not a wholesale import or approval of its existing overlay.
-
-`scripts/patches/test_glm53_live_retention_storage_hash.py` exercises the real
-native hash, DCP prepare and shared-read key builder against the trusted worker
-package. Admission voting/storage reservation are doubles; it is not a real
-storage/receipt or TP8 integration gate. Run with that captured package on
-`PYTHONPATH`, in a Linux CPU-only container, using
-`python -m pytest -p no:cacheprovider --disable-warnings /path/to/test_glm53_live_retention_storage_hash.py -q`.
-The native C++ extension needs an executable container-private build tmpfs;
-read-only root, no network/GPU, and CPU/memory/PID limits remain enabled.
-Original source: 4 failed / 4 passed; candidate: 8 passed (20 dependency warnings).
-Identical package paths/configuration: Pyright 31 errors to 29, zero new
-fingerprints, **not whole-file green**. A detached two-file baseline comparison
-had different import topology and was rejected rather than used for approval.
-
-The real node58 candidate probe subsequently returned HTTP500 after 101.459s;
-worker ACK reads reported TCP EOF and `TRANSFER_FAIL(-800)`. The transport
-root cause is not established. At the user's interruption the remote rollback
-had already restored the two original overlay files and restarted the worker;
-readback showed health200. No further automatic rollback is authorized.
-Backend/producer diagnostic logs have been removed. The four prior interface
-fixes remain; no other worker, Flash service or public route was changed.
-Cache-write, TTL/expiry/restart, receipts/billing and public-fleet gates remain
-unpassed. This candidate and its CPU evidence must not be described as deployed
-or accepted.
+Only the validated wire/backport/test changes belong to this PR's merge scope.
+The storage-namespace candidate and its CPU tests are retained on the separate
+`fix/glm53-retention-storage-hash-68` branch/PR: CPU passed, actual GPU probe
+failed. Cache writes, TTL/expiry/restart, L3 receipts and billing remain open
+under issue68. Merging wire changes does not authorize rollout or claim those
+cache gates passed. No further automatic live rollback is authorized.
