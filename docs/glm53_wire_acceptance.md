@@ -253,3 +253,33 @@ fixes remain; no other worker, Flash service or public route was changed.
 Cache-write, TTL/expiry/restart, receipts/billing and public-fleet gates remain
 unpassed. This candidate and its CPU evidence must not be described as deployed
 or accepted.
+
+## Protected singleton scratch read follow-up
+
+Actual current native binding inspection proves ordinary `batch_get_into`
+uses READ0x80 for the allocated-memory/TCP branch, incompatible with the
+receiver's protected READ0xc0 plus proof requirement. SDK `get_into(key, ptr,
+size)` directly reaches `GetMemoryReplicaHeld` on the host-memory branch and
+obtains its real grant through native master callbacks. Missing Python proof
+arguments are not evidence that the SDK cannot obtain a grant.
+
+The new bounded DCP-only patch
+`scripts/patches/glm53-native-dcp-protected-read-worker.patch` switches `_blob`
+to that existing scalar entry, checks capability before registering scratch,
+validates the span and exact integer byte count, and retains `io_lock` through
+copy-out. Native failure/partial/unknown stays `None`; there is no ordinary
+batch fallback, forged grant or guessed Python Finish/End call. Native owns
+its Claim/Finish/Abort lifecycle. General multi-key/nested reads are not changed.
+
+The adjacent test runs real DCP methods and CPU Torch allocations with a strict
+SDK signature double, not real transport/grant/receipt IO. Original source:
+19 failed / 4 passed; candidate: 23 passed. Together with real native-hash cases:
+31 passed, 20 dependency warnings. Same source path/package/configuration
+Pyright 18 errors to 15, zero new; baseline findings remain, not full-file green.
+
+The separately authorized 30s observation attempt failed during bpftrace live
+attach (address/interior-offset support unavailable). No valid event records
+were collected: not verified zero traffic or a successful transport gate.
+Owned probe processes/definitions and scratch directories were removed;
+service identity/lifetime unchanged. This candidate still needs actual node58
+storage/receipt/TTL acceptance; merging source does not authorize fleet rollout.

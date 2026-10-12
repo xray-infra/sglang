@@ -1,0 +1,39 @@
+--- a/python/sglang/srt/mem_cache/storage/dcp_hicache_storage.py
++++ b/python/sglang/srt/mem_cache/storage/dcp_hicache_storage.py
+@@ -90,6 +90,8 @@
+                 raise ValueError("Mooncake DCP requires independent two-owner storage durability")
+             if not callable(getattr(backend.store, "unregister_buffer", None)):
+                 raise ValueError("Mooncake client must support buffer unregistration")
++            if not callable(getattr(backend.store, "get_into", None)):
++                raise ValueError("Mooncake client must support protected scalar reads")
+             if getattr(getattr(backend, "config", None), "standalone_storage", False):
+                 raise ValueError("DCP adapter requires in-process Mooncake client")
+             size = max(self.metadata_bytes, descriptor["mla_page_nbytes"], descriptor["indexer_page_nbytes"])
+@@ -132,18 +134,22 @@
+         return f"dcpv1_{self.namespace}_{key}"
+
+     def _blob(self, key, nbytes):
++        if type(nbytes) is not int or nbytes <= 0:
++            return None
+         if self.closed or self.closing or self.cancelled():
+             return None
+         try:
+             if self.zero_copy:
+                 with self.io_lock:
+-                    if self.closed or self.closing or nbytes > self.scratch.numel():
++                    scratch = self.scratch
++                    if self.closed or self.closing or self.cancelled() or scratch is None or nbytes > scratch.numel():
+                         return None
+-                    got = self.backend._get_batch_zero_copy_impl(
+-                        [key], [self.scratch.data_ptr()], [nbytes])
+-                    if got != [nbytes]:
++                    # Scalar get_into uses the native held/protected READ path;
++                    # ordinary batch_get_into cannot satisfy the receiver gate.
++                    got = self.backend.store.get_into(key, scratch.data_ptr(), nbytes)
++                    if type(got) is not int or got != nbytes:
+                         return None
+-                    return raw(self.scratch[:nbytes])
++                    return raw(scratch[:nbytes])
+             out = self.backend.get(key, torch.empty(nbytes, dtype=torch.uint8))
+             return None if out is None else raw(out)
+         except (OSError, ValueError, RuntimeError):
