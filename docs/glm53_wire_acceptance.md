@@ -283,3 +283,26 @@ were collected: not verified zero traffic or a successful transport gate.
 Owned probe processes/definitions and scratch directories were removed;
 service identity/lifetime unchanged. This candidate still needs actual node58
 storage/receipt/TTL acceptance; merging source does not authorize fleet rollout.
+
+## Two-owner segment/transport identity fix
+
+Fresh native request720da7051f2945a3b6588c78a36da6e5 demonstrated exact
+protected reads of8192-byte ACKs and3274752/177408-byte components, but all
+ranks remained L1-only. Rank0 finalizer consistently reported data_ready=False.
+Current descriptors were COMPLETE, with exact lengths. The policy compared
+segment aliases43:13288/44:12301 to TE endpoints43:16696/44:15199.
+Master `/get_segments_detail` supplies both separate names, native segment/client
+UUIDs, allocation base/size and current status; the actual SDK Descriptor supplies
+buffer address, size and transport endpoint, not a readable owner UUID.
+
+`glm53-native-replica-owner-worker.patch` maps exact TE endpoint AND contained
+allocation range back to the qualified current segment name. It preserves two
+independent segment/client UUIDs, exact COMPLETE/byte-size checks and a current
+owner fence including TE/base/capacity. Missing mapping fails closed; no host-only
+fallback. Copy/preferred-segment configuration still uses segment aliases.
+
+Real policy-method regression against SDK/HTTP doubles: original3 failed/13 passed,
+candidate16 passed. Combined owner/scratch/native-hash suite47 passed/20 warnings.
+This is not native receipt/TTL proof. Temporary metadata diagnostics are removed
+when this candidate is applied, retaining the protected scratch and namespace
+fixes. Single-worker actual paid-cache acceptance remains required.
