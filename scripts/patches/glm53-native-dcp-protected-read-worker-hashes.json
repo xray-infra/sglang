@@ -1,0 +1,10 @@
+{
+  "kind": "captured-worker-minimal-delta",
+  "source_sha256": {
+    "python/sglang/srt/mem_cache/storage/dcp_hicache_storage.py": {
+      "before": "43429a6cc97a5c09e2fee68d7269ef321a84a7a835352436ead63be4f4efe5b1",
+      "after": "431ef5910005bb19d5b3a34a832e02e1a57e08982339702e0d72c32d19f38112"
+    }
+  },
+  "scope": "DCP singleton registered scratch only; SDK supplies genuine protected proof"
+}

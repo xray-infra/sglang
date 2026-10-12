@@ -215,3 +215,94 @@ The storage-namespace candidate and its CPU tests are retained on the separate
 failed. Cache writes, TTL/expiry/restart, L3 receipts and billing remain open
 under issue68. Merging wire changes does not authorize rollout or claim those
 cache gates passed. No further automatic live rollback is authorized.
+
+## L3 namespace follow-up (2026-10-12; not accepted for rollout)
+
+The captured worker's DCP retention and shared-read callers used `get_hash_str`,
+while actual HiCache writes use `get_storage_hash_str`, including the
+`extra_key`/`cache_salt` namespace seed. A correlated fresh 5m request showed
+identical DCP namespaces but different reserved/storage page roots on all eight
+ranks, `retained_owners=0`, absent ACKs and master commit error `-703`.
+
+The minimal live-overlay delta is
+`scripts/patches/glm53-native-retention-storage-hash-worker.patch`; its adjacent
+hash manifest pins the original and candidate bytes of both overlay modules.
+Those modules are absent from this repository baseline: this is a bounded
+worker backport, not a wholesale import or approval of its existing overlay.
+
+`scripts/patches/test_glm53_live_retention_storage_hash.py` exercises the real
+native hash, DCP prepare and shared-read key builder against the trusted worker
+package. Admission voting/storage reservation are doubles; it is not a real
+storage/receipt or TP8 integration gate. Run with that captured package on
+`PYTHONPATH`, in a Linux CPU-only container, using
+`python -m pytest -p no:cacheprovider --disable-warnings /path/to/test_glm53_live_retention_storage_hash.py -q`.
+The native C++ extension needs an executable container-private build tmpfs;
+read-only root, no network/GPU, and CPU/memory/PID limits remain enabled.
+Original source: 4 failed / 4 passed; candidate: 8 passed (20 dependency warnings).
+Identical package paths/configuration: Pyright 31 errors to 29, zero new
+fingerprints, **not whole-file green**. A detached two-file baseline comparison
+had different import topology and was rejected rather than used for approval.
+
+The real node58 candidate probe subsequently returned HTTP500 after 101.459s;
+worker ACK reads reported TCP EOF and `TRANSFER_FAIL(-800)`. The transport
+root cause is not established. At the user's interruption the remote rollback
+had already restored the two original overlay files and restarted the worker;
+readback showed health200. No further automatic rollback is authorized.
+Backend/producer diagnostic logs have been removed. The four prior interface
+fixes remain; no other worker, Flash service or public route was changed.
+Cache-write, TTL/expiry/restart, receipts/billing and public-fleet gates remain
+unpassed. This candidate and its CPU evidence must not be described as deployed
+or accepted.
+
+## Protected singleton scratch read follow-up
+
+Actual current native binding inspection proves ordinary `batch_get_into`
+uses READ0x80 for the allocated-memory/TCP branch, incompatible with the
+receiver's protected READ0xc0 plus proof requirement. SDK `get_into(key, ptr,
+size)` directly reaches `GetMemoryReplicaHeld` on the host-memory branch and
+obtains its real grant through native master callbacks. Missing Python proof
+arguments are not evidence that the SDK cannot obtain a grant.
+
+The new bounded DCP-only patch
+`scripts/patches/glm53-native-dcp-protected-read-worker.patch` switches `_blob`
+to that existing scalar entry, checks capability before registering scratch,
+validates the span and exact integer byte count, and retains `io_lock` through
+copy-out. Native failure/partial/unknown stays `None`; there is no ordinary
+batch fallback, forged grant or guessed Python Finish/End call. Native owns
+its Claim/Finish/Abort lifecycle. General multi-key/nested reads are not changed.
+
+The adjacent test runs real DCP methods and CPU Torch allocations with a strict
+SDK signature double, not real transport/grant/receipt IO. Original source:
+19 failed / 4 passed; candidate: 23 passed. Together with real native-hash cases:
+31 passed, 20 dependency warnings. Same source path/package/configuration
+Pyright 18 errors to 15, zero new; baseline findings remain, not full-file green.
+
+The separately authorized 30s observation attempt failed during bpftrace live
+attach (address/interior-offset support unavailable). No valid event records
+were collected: not verified zero traffic or a successful transport gate.
+Owned probe processes/definitions and scratch directories were removed;
+service identity/lifetime unchanged. This candidate still needs actual node58
+storage/receipt/TTL acceptance; merging source does not authorize fleet rollout.
+
+## Two-owner segment/transport identity fix
+
+Fresh native request720da7051f2945a3b6588c78a36da6e5 demonstrated exact
+protected reads of8192-byte ACKs and3274752/177408-byte components, but all
+ranks remained L1-only. Rank0 finalizer consistently reported data_ready=False.
+Current descriptors were COMPLETE, with exact lengths. The policy compared
+segment aliases43:13288/44:12301 to TE endpoints43:16696/44:15199.
+Master `/get_segments_detail` supplies both separate names, native segment/client
+UUIDs, allocation base/size and current status; the actual SDK Descriptor supplies
+buffer address, size and transport endpoint, not a readable owner UUID.
+
+`glm53-native-replica-owner-worker.patch` maps exact TE endpoint AND contained
+allocation range back to the qualified current segment name. It preserves two
+independent segment/client UUIDs, exact COMPLETE/byte-size checks and a current
+owner fence including TE/base/capacity. Missing mapping fails closed; no host-only
+fallback. Copy/preferred-segment configuration still uses segment aliases.
+
+Real policy-method regression against SDK/HTTP doubles: original3 failed/13 passed,
+candidate16 passed. Combined owner/scratch/native-hash suite47 passed/20 warnings.
+This is not native receipt/TTL proof. Temporary metadata diagnostics are removed
+when this candidate is applied, retaining the protected scratch and namespace
+fixes. Single-worker actual paid-cache acceptance remains required.

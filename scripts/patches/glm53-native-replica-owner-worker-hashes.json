@@ -1,0 +1,9 @@
+{
+  "scope": "qualified2ownerTEendpoint+allocation-range+UUIDepoch fence; alias kept for copies",
+  "source_sha256": {
+    "python/sglang/srt/mem_cache/storage/mooncake_store/replica_policy.py": {
+      "before": "0195a8ceff0ad7a64a284658b43dbb83236d932419ea9ef5141c59c5411232fd",
+      "after": "da1b8a3ac0af7ac7ec55dff9561dc927597cf4f7ca38fb3cf2a85f8e70a83c3a"
+    }
+  }
+}
