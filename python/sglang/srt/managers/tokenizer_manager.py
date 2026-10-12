@@ -835,6 +835,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self._init_req_state(obj, request)
         request_rids = {obj.rid} if obj.is_single else set(obj.rid)
+        public_terminal_emitted = False
         try:
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -856,13 +857,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
                     async for response in self._wait_one_response(obj, request):
+                        finish_reason = response.get("meta_info", {}).get("finish_reason")
+                        if (isinstance(finish_reason, dict)
+                                and finish_reason.get("type") != "abort"):
+                            public_terminal_emitted = True
                         yield response
                 else:
                     async for response in self._handle_batch_request(
                         obj, request, request_rids
                     ):
+                        # Non-streaming batches yield one list[dict]. Inspect
+                        # each choice for terminal metadata, but preserve the
+                        # list as one generator item for the OpenAI adapter.
+                        responses = response if isinstance(response, list) else [response]
+                        for item in responses:
+                            finish_reason = item.get("meta_info", {}).get("finish_reason")
+                            if (isinstance(finish_reason, dict)
+                                    and finish_reason.get("type") != "abort"):
+                                public_terminal_emitted = True
                         yield response
-        except BaseException:
+        except BaseException as error:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -870,7 +884,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # request -- would otherwise leak those entries forever. Drop
             # undelivered states, but abort dispatched requests for scheduler-side
             # cleanup.
-            self._release_req_states_on_failure(request_rids)
+            # A streamed batch may finish one choice before the others. Only
+            # skip failure cleanup once every request state has retired.
+            all_request_states_retired = not any(
+                rid in self.rid_to_state for rid in request_rids
+            )
+            normal_terminal_close = (
+                public_terminal_emitted
+                and all_request_states_retired
+                and isinstance(error, (GeneratorExit, asyncio.CancelledError))
+            )
+            if not normal_terminal_close:
+                self._release_req_states_on_failure(request_rids)
             raise
 
     def _detect_input_format(
