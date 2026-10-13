@@ -335,6 +335,7 @@ class HiCacheNixl(HiCacheStorage):
                     return False
                 success = self._xfer_and_wait(host_descs, storage_descs, direction)
             if success and retention_duration_seconds is not None:
+                assert retention is not None
                 retention.publish_deadlines(keys, retention_duration_seconds)
             return success
 
