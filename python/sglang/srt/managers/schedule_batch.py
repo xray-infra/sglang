@@ -1252,6 +1252,9 @@ class Req(ReqDllmMixin):
         # retain-prefix actions to post-template token boundaries. Keys are
         # retention durations in seconds; values are cumulative prefix lengths.
         self.cache_retention_applied_prefix_lens: Dict[int, int] = {}
+        # Terminal output is suppressed while the native executor owns this
+        # request and cleared only when all retained writes have rank-acked.
+        self.cache_retention_output_deferred = False
         self.already_computed = 0
 
         # Detailed breakdown of cached tokens by source (for HiCache)

@@ -176,7 +176,7 @@ class SchedulerOutputStreamer:
             current_weight_version=get_serving().weight_version,
         )
         for req in reqs:
-            if req is skip_req:
+            if req is skip_req or req.cache_retention_output_deferred:
                 continue
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice

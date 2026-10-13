@@ -109,6 +109,23 @@ class SchedulerBatchResultProcessor:
     beam_coordinator: BeamCoordinator
     abort_request: Callable
 
+    def _release_kv_and_begin_retention(
+        self, req: Req, *, is_insert: bool = True
+    ) -> None:
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        if not req.cache_retention_intents:
+            return
+        begin = getattr(self.tree_cache, "begin_cache_retention", None)
+        if not callable(begin):
+            raise RuntimeError("active cache lost retention capability after admission")
+        try:
+            begin(req)
+        except Exception:
+            logger.exception("Failed to start cache retention for req %s", req.rid)
+            # begin_cache_retention owns explicit failure publication once it
+            # has deferred terminal output. Do not let the natural terminal
+            # response escape as an apparent success.
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
@@ -121,7 +138,7 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache)
+                self._release_kv_and_begin_retention(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -353,7 +370,7 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
-                        release_kv_cache(req, self.tree_cache)
+                        self._release_kv_and_begin_retention(req)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -439,7 +456,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        self._release_kv_and_begin_retention(req)
                         req.time_stats.set_completion_time()
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -1209,7 +1226,7 @@ class SchedulerBatchResultProcessor:
                     if mamba_extra_buffer_lazy_enabled()
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                self._release_kv_and_begin_retention(req, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
 

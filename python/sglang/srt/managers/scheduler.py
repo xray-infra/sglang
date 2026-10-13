@@ -2838,6 +2838,40 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if req.cache_retention_intents:
+            capability_error = "the active cache does not implement retention"
+            capability_check = getattr(
+                self.tree_cache, "cache_retention_capability_error", None
+            )
+            if callable(capability_check):
+                capability_error = capability_check()
+            if capability_error is None and (
+                self.disaggregation_mode != DisaggregationMode.NULL
+                or get_disagg().disaggregation_decode_enable_offload_kvcache
+            ):
+                capability_error = (
+                    "explicit retention is unsupported with disaggregated or "
+                    "decode-offload execution"
+                )
+            if capability_error is None:
+                unaligned = [
+                    intent.prefix_token_count
+                    for intent in req.cache_retention_intents
+                    if intent.prefix_token_count % self.page_size != 0
+                ]
+                if unaligned:
+                    capability_error = (
+                        f"token boundary {unaligned[0]} is not exactly representable "
+                        f"by the {self.page_size}-token cache/storage page layout"
+                    )
+            if capability_error is not None:
+                error_msg = f"Invalid cache retention request: {capability_error}"
+                logger.error("%s; req.rid=%s", error_msg, req.rid)
+                req.set_finish_with_abort(error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
         if req.cache_retention_intents and (
             recv_req.mm_inputs is not None
             or recv_req.session_id is not None
@@ -4517,6 +4551,20 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
+    def _emit_cache_retention_outputs(self) -> None:
+        take_ready = getattr(
+            self.tree_cache, "take_cache_retention_ready_outputs", None
+        )
+        if not callable(take_ready):
+            return
+        ready = take_ready()
+        if not isinstance(ready, list):
+            raise TypeError("cache retention output queue must return a list")
+        for req in ready:
+            # Emit independently because return_logprob is a per-request
+            # property after a request leaves its scheduling batch.
+            self.output_streamer.stream_output([req], req.return_logprob)
+
     @scheduler_nvtx_method("scheduler.process_batch_result")
     def process_batch_result(
         self,
@@ -4560,6 +4608,7 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+        self._emit_cache_retention_outputs()
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -4646,6 +4695,7 @@ class Scheduler(
 
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        self._emit_cache_retention_outputs()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -5131,6 +5181,9 @@ class Scheduler(
         }
 
     def abort_request(self, recv_req: AbortReq):
+        abort_retentions = getattr(self.tree_cache, "abort_cache_retentions", None)
+        if callable(abort_retentions):
+            abort_retentions(recv_req.rid, abort_all=recv_req.abort_all)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

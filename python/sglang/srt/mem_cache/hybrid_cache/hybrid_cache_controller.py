@@ -51,10 +51,13 @@ class StorageOperation(BaseStorageOperation):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        retention_duration_seconds: Optional[int] = None,
     ):
         super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
+        self.retention_duration_seconds = retention_duration_seconds
+        self.success = False
 
 
 class PrefetchOperation(StorageOperation):
@@ -564,6 +567,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        retention_duration_seconds: Optional[int] = None,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -571,6 +575,7 @@ class HybridCacheController(BaseHiCacheController):
             hash_value=hash_value,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            retention_duration_seconds=retention_duration_seconds,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -676,6 +681,9 @@ class HybridCacheController(BaseHiCacheController):
         return
 
     def _page_backup(self, operation):
+        extra_info = HiCacheStorageExtraInfo(
+            retention_duration_seconds=operation.retention_duration_seconds
+        )
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [
@@ -687,15 +695,33 @@ class HybridCacheController(BaseHiCacheController):
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(backup_transfers)
+            results = self.storage_backend.batch_set_v2(backup_transfers, extra_info)
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
         if not self.backup_skip:
             super()._page_backup(operation)
+            kv_ok = (
+                operation.completed_tokens == len(operation.hash_value) * self.page_size
+            )
+            pools_ok = all(
+                operation.pool_storage_result.extra_pool_hit_pages.get(
+                    transfer.name,
+                    operation.pool_storage_result.extra_pool_hit_pages.get(
+                        transfer.name.value, 0
+                    ),
+                )
+                == len(transfer.keys or [])
+                for transfer in backup_transfers
+            )
+            operation.success = kv_ok and pools_ok
         else:
-            sidecar_ok = bool(backup_transfers)
-            if sidecar_ok:
+            # A retained write on an MLA non-owner rank may have no physical
+            # object of its own; that rank still contributes a successful ack.
+            sidecar_ok = bool(backup_transfers) or (
+                operation.retention_duration_seconds is not None
+            )
+            if backup_transfers:
                 for transfer in backup_transfers:
                     result = results.get(transfer.name)
                     if result is None:
@@ -713,6 +739,7 @@ class HybridCacheController(BaseHiCacheController):
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
+            operation.success = sidecar_ok
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:
@@ -748,7 +775,11 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
+                try:
+                    self._page_backup(operation)
+                except Exception:
+                    operation.success = False
+                    logger.exception("Storage backup operation %s failed", operation.id)
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue

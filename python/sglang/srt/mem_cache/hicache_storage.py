@@ -44,6 +44,9 @@ class HiCacheStorageConfig:
 class HiCacheStorageExtraInfo:
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
+    # Explicit retained writes carry their deadline policy alongside the data
+    # operation. Storage adapters which do not implement retention ignore None.
+    retention_duration_seconds: Optional[int] = None
 
 
 @dataclass(frozen=True)

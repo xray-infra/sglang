@@ -4,7 +4,7 @@ import atexit
 import logging
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -143,6 +143,18 @@ class _OngoingPrefetch(NamedTuple):
     operation: PrefetchOperation
     anchor_lock_params: DecLockRefParams
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
+
+
+@dataclass
+class _RetentionTransaction:
+    req: Req
+    applied_prefix_lens: dict[int, int]
+    node_id: NodeId
+    lock_params: DecLockRefParams
+    operation_ids: set[int]
+    failed: bool = False
+    queued: bool = False
+    cancelled: bool = False
 
 
 class UnifiedRadixCache(BasePrefixCache):
@@ -347,6 +359,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        for tx in getattr(self, "_retention_transactions", {}).values():
+            self.dec_lock_ref(tx.node_id, tx.lock_params)
+        self._retention_transactions = {}
+        self._retention_operation_rids = {}
+        self._retention_ready_outputs = []
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -366,6 +383,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # popped by the scheduler to pace availability-check retries.
         self._storage_prefetch_missed_rids: set[str] = set()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        self._retention_transactions: dict[str, _RetentionTransaction] = {}
+        self._retention_operation_rids: dict[int, str] = {}
+        self._retention_ready_outputs: list[Req] = []
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
 
@@ -1736,14 +1756,233 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return transfers
 
-    def write_backup_storage(self, node_id: NodeId) -> None:
+    def cache_retention_capability_error(self) -> Optional[str]:
+        """Return why the deliberately narrow native retention path is unavailable."""
         if not self.enable_storage or self.cache_controller is None:
+            return "HiCache storage is not enabled"
+        if not isinstance(self.cache_controller, HybridCacheController):
+            return "the active HiCache controller does not support retained writes"
+        if self.host_memory_mode != "cache":
+            return "explicit retention requires HiCache cache host-memory mode"
+        if not isinstance(self.tree_core, UnifiedTreeCore):
+            return "explicit retention requires the Python Unified radix cache core"
+        backend = self.cache_controller.storage_backend
+        if backend is None or type(backend).__name__ != "HiCacheNixl":
+            return "explicit retention requires the built-in NIXL FILE backend"
+        selector = getattr(backend, "backend_selector", None)
+        file_manager = getattr(backend, "file_manager", None)
+        retention = getattr(file_manager, "retention", None)
+        if (
+            selector is None
+            or getattr(selector, "mem_type", None) != "FILE"
+            or file_manager is None
+            or retention is None
+            or getattr(backend, "_l3_cleaner", None) is None
+            or not getattr(retention, "retention_supported", False)
+        ):
+            return (
+                "explicit retention requires NIXL FILE with the built-in "
+                "cleaner and retention capability"
+            )
+        return None
+
+    def _retention_path(self, req: Req, boundary: int) -> list[NodeId]:
+        key = RadixKey(
+            req.origin_input_ids[:boundary],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        if len(key) != boundary:
+            raise ValueError(
+                f"retention boundary {boundary} is not exactly representable by "
+                f"the {self.page_size}-token storage page layout"
+            )
+        result = self.match_prefix(MatchPrefixParams(key=key))
+        if result.full_kv_hit_length != boundary:
+            raise RuntimeError(
+                f"retained prefix has only {result.full_kv_hit_length} of "
+                f"{boundary} committed cache tokens"
+            )
+        # best_match_node is the deepest exact radix node accepted across
+        # device- and host-resident components; renewals may have no device node.
+        node = self.tree_core.node_by_id(result.best_match_node)
+        path: list[NodeId] = []
+        represented = 0
+        while node.parent is not None:
+            path.append(node.id)
+            assert node.key is not None
+            represented += len(node.key)
+            node = node.parent
+        path.reverse()
+        if represented != boundary:
+            raise RuntimeError(
+                f"retained radix path represents {represented}, expected {boundary} tokens"
+            )
+        return path
+
+    def begin_cache_retention(self, req: Req) -> None:
+        """Pin an exact committed prefix and queue its durable retained writes."""
+        if not req.cache_retention_intents:
             return
+        if req.rid in self._retention_transactions:
+            return
+        req.cache_retention_output_deferred = True
+        try:
+            capability_error = self.cache_retention_capability_error()
+            if capability_error is not None:
+                raise RuntimeError(capability_error)
+            applied = {
+                intent.duration_seconds: intent.prefix_token_count
+                for intent in req.cache_retention_intents
+            }
+            longest = max(applied.values())
+            path = self._retention_path(req, longest)
+            if not path:
+                raise RuntimeError(
+                    "retained prefix did not resolve to physical radix pages"
+                )
+            lock_node_id = path[-1]
+            lock_params = self.inc_lock_ref(lock_node_id).to_dec_params()
+        except Exception:
+            from http import HTTPStatus
+
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            req.cache_retention_applied_prefix_lens = {}
+            req.cache_write_tokens = None
+            req.cache_write_tokens_by_ttl = None
+            req.finished_reason = FINISH_ABORT(
+                "Failed to resolve cache retention against committed storage pages",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+            )
+            self._retention_ready_outputs.append(req)
+            raise
+        tx = _RetentionTransaction(req, applied, lock_node_id, lock_params, set())
+        self._retention_transactions[req.rid] = tx
+        try:
+            if self._execute_and_commit_kv_backup(BackupKV(node_ids=path)) == 0:
+                # Zero means either every node was already host-resident or the
+                # first allocation failed. The polling step distinguishes them.
+                pass
+            self._poll_cache_retention_transactions()
+        except Exception:
+            self._finish_cache_retention_transaction(tx, success=False)
+            raise
+
+    def _poll_cache_retention_transactions(self) -> None:
+        for tx in list(self._retention_transactions.values()):
+            if tx.queued or tx.failed:
+                continue
+            writes: list[tuple[NodeId, int]] = []
+            ready = True
+            unavailable = False
+            for duration, boundary in tx.applied_prefix_lens.items():
+                for node_id in self._retention_path(tx.req, boundary):
+                    if node_id in self.ongoing_write_through:
+                        ready = False
+                        break
+                    if (
+                        self.tree_core.build_storage_backup_spec(
+                            node_id, self.hicache_storage_pass_prefix_keys
+                        )
+                        is None
+                    ):
+                        # No pending D→H owner means allocation/publication
+                        # failed and waiting cannot make this page writable.
+                        unavailable = True
+                        ready = False
+                        break
+                    writes.append((node_id, duration))
+                if not ready:
+                    break
+            if unavailable:
+                self._finish_cache_retention_transaction(tx, success=False)
+                continue
+            if not ready:
+                continue
+            tx.queued = True
+            try:
+                for node_id, duration in writes:
+                    operation_id = self.write_backup_storage(
+                        node_id,
+                        retention_duration_seconds=duration,
+                        retention_rid=tx.req.rid,
+                    )
+                    if operation_id is None:
+                        raise RuntimeError("retained storage write could not be queued")
+                    tx.operation_ids.add(operation_id)
+                if not tx.operation_ids:
+                    self._finish_cache_retention_transaction(tx, success=True)
+            except Exception:
+                self._finish_cache_retention_transaction(tx, success=False)
+
+    def _reduce_cache_retention_success(self, local_success: bool) -> bool:
+        """Reduce one retained-write result across every participating rank."""
+        success_tensor = torch.tensor(int(local_success), dtype=torch.int)
+        self._all_reduce(success_tensor, torch.distributed.ReduceOp.MIN)
+        return bool(success_tensor.item())
+
+    def _finish_cache_retention_transaction(
+        self, tx: _RetentionTransaction, *, success: bool
+    ) -> None:
+        if self._retention_transactions.pop(tx.req.rid, None) is None:
+            return
+        for operation_id in tx.operation_ids:
+            self._retention_operation_rids.pop(operation_id, None)
+        self.dec_lock_ref(tx.node_id, tx.lock_params)
+        if success and not tx.cancelled:
+            self.finalize_cache_retention_usage(tx.req, tx.applied_prefix_lens)
+        elif not tx.cancelled:
+            from http import HTTPStatus
+
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            tx.req.cache_retention_applied_prefix_lens = {}
+            tx.req.cache_write_tokens = None
+            tx.req.cache_write_tokens_by_ttl = None
+            tx.req.finished_reason = FINISH_ABORT(
+                "Failed to durably retain every required cache pool and rank",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+            )
+        if not tx.cancelled:
+            self._retention_ready_outputs.append(tx.req)
+
+    def take_cache_retention_ready_outputs(self) -> list[Req]:
+        ready, self._retention_ready_outputs = self._retention_ready_outputs, []
+        for req in ready:
+            req.cache_retention_output_deferred = False
+        return ready
+
+    def abort_cache_retention(self, rid: str) -> None:
+        tx = self._retention_transactions.get(rid)
+        if tx is None:
+            return
+        tx.cancelled = True
+        if not tx.operation_ids:
+            self._finish_cache_retention_transaction(tx, success=False)
+
+    def abort_cache_retentions(self, rid_prefix: str, *, abort_all: bool) -> None:
+        for rid in list(self._retention_transactions):
+            if abort_all or rid.startswith(rid_prefix):
+                self.abort_cache_retention(rid)
+
+    def write_backup_storage(
+        self,
+        node_id: NodeId,
+        *,
+        retention_duration_seconds: int | None = None,
+        retention_rid: str | None = None,
+    ) -> int | None:
+        if not self.enable_storage or self.cache_controller is None:
+            return None
         spec = self.tree_core.build_storage_backup_spec(
             node_id, self.hicache_storage_pass_prefix_keys
         )
         if spec is None:
-            return
+            return None
 
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
@@ -1762,11 +2001,15 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.hash_value,
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
+            retention_duration_seconds=retention_duration_seconds,
         )
         self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
+        if retention_rid is not None:
+            self._retention_operation_rids[operation_id] = retention_rid
+        return operation_id
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -2682,6 +2925,12 @@ class UnifiedRadixCache(BasePrefixCache):
             drained = 0
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
+                retention_rid = self._retention_operation_rids.pop(operation.id, None)
+                retention_success = None
+                if retention_rid is not None:
+                    retention_success = self._reduce_cache_retention_success(
+                        bool(getattr(operation, "success", False))
+                    )
                 if buffer_mode:
                     # Storage write acked: free the staging.
                     self.buffer_pipeline.finish_storage_write_ack(operation.id)
@@ -2690,6 +2939,15 @@ class UnifiedRadixCache(BasePrefixCache):
                     if entry is not None:
                         node_id, lock_params = entry
                         self.dec_host_lock_ref(node_id, lock_params)
+                if retention_rid is not None:
+                    tx = self._retention_transactions.get(retention_rid)
+                    if tx is not None:
+                        tx.operation_ids.discard(operation.id)
+                        tx.failed = tx.failed or not retention_success
+                        if not tx.operation_ids:
+                            self._finish_cache_retention_transaction(
+                                tx, success=not tx.failed and not tx.cancelled
+                            )
                 if (
                     log_metrics
                     and self.enable_storage_metrics
@@ -2733,6 +2991,7 @@ class UnifiedRadixCache(BasePrefixCache):
         _drain_and_alloc_storage_hit()
         _drain_ack_prefetch()
         _drain_backup()
+        self._poll_cache_retention_transactions()
         _drain_release()
         _drain_extra_release()
 
