@@ -2830,6 +2830,33 @@ class Scheduler(
 
         self._maybe_namespace_elastic_radix_cache(req)
 
+        if req.cache_retention_error is not None:
+            error_msg = f"Invalid cache retention request: {req.cache_retention_error}"
+            logger.error("%s; req.rid=%s", error_msg, req.rid)
+            req.set_finish_with_abort(error_msg, status_code=HTTPStatus.BAD_REQUEST)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if req.cache_retention_intents and (
+            recv_req.mm_inputs is not None
+            or recv_req.session_id is not None
+            or recv_req.session_params is not None
+        ):
+            # The current worker-token boundary contract describes the plain
+            # prompt token_ids. Multimodal expansion and server-side session
+            # prefixes mutate that coordinate space after ingress, so applying
+            # the original count would retain and bill the wrong prefix.
+            error_msg = (
+                "Explicit cache retention is not supported with multimodal "
+                "inputs or server-side sessions"
+            )
+            logger.error("%s; req.rid=%s", error_msg, req.rid)
+            req.set_finish_with_abort(error_msg, status_code=HTTPStatus.BAD_REQUEST)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         if mm_input_error is not None:
             req.set_finish_with_abort(
                 mm_input_error,

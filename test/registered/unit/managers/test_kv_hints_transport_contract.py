@@ -78,7 +78,7 @@ def envelope(name="one"):
                 "action_id": name,
                 "action_type": "kv.retain_prefix",
                 "action_version": "1.0",
-                "payload": {"ttl_seconds": 300, "prefix_token_count": 256},
+                "payload": {"duration_seconds": 300, "prefix_token_count": 256},
             }
         ],
     }
@@ -121,6 +121,103 @@ class KvHintsTransportContract(unittest.TestCase):
         for value in bad:
             with self.subTest(ingress=value), self.assertRaises(ValueError):
                 Generate(text="test", kv_hints=value).normalize_batch_and_arguments()
+
+    def test_retention_intents_require_exact_worker_boundaries(self):
+        decoded = hints.decode_kv_hints_envelope(envelope())
+        self.assertEqual(
+            hints.parse_cache_retention_intents(decoded, prompt_token_count=512),
+            (
+                hints.CacheRetentionIntent(
+                    action_id="one",
+                    prefix_token_count=256,
+                    duration_seconds=300,
+                ),
+            ),
+        )
+
+        opaque_value = envelope()
+        opaque_value["actions"][0]["action_type"] = "future.example"
+        opaque = hints.decode_kv_hints_envelope(opaque_value)
+        self.assertEqual(
+            hints.parse_cache_retention_intents(opaque, prompt_token_count=512), ()
+        )
+
+        cases = {
+            "protocol_version": ({**envelope(), "protocol_version": "9.0"}, "protocol_version"),
+            "action_version": (
+                {
+                    **envelope(),
+                    "actions": [
+                        {**envelope()["actions"][0], "action_version": "2.0"}
+                    ],
+                },
+                "action_version",
+            ),
+            "missing_prefix": (
+                {
+                    **envelope(),
+                    "actions": [
+                        {
+                            **envelope()["actions"][0],
+                            "payload": {"duration_seconds": 300},
+                        }
+                    ],
+                },
+                "prefix_token_count",
+            ),
+            "boolean_duration": (
+                {
+                    **envelope(),
+                    "actions": [
+                        {
+                            **envelope()["actions"][0],
+                            "payload": {
+                                "duration_seconds": True,
+                                "prefix_token_count": 256,
+                            },
+                        }
+                    ],
+                },
+                "duration_seconds",
+            ),
+            "duration_limit": (
+                {
+                    **envelope(),
+                    "actions": [
+                        {
+                            **envelope()["actions"][0],
+                            "payload": {
+                                "duration_seconds": 86_401,
+                                "prefix_token_count": 256,
+                            },
+                        }
+                    ],
+                },
+                "worker limit",
+            ),
+            "prompt_limit": (envelope(), "worker prompt length"),
+        }
+        for name, (value, error) in cases.items():
+            prompt_token_count = 128 if name == "prompt_limit" else 512
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
+                hints.parse_cache_retention_intents(
+                    hints.decode_kv_hints_envelope(value),
+                    prompt_token_count=prompt_token_count,
+                )
+
+        out_of_order = envelope()
+        out_of_order["actions"].append(
+            {
+                "action_id": "two",
+                "action_type": "kv.retain_prefix",
+                "action_version": "1.0",
+                "payload": {"duration_seconds": 300, "prefix_token_count": 128},
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            hints.parse_cache_retention_intents(
+                hints.decode_kv_hints_envelope(out_of_order), prompt_token_count=512
+            )
 
     def test_single_and_broadcast_batch_parallel_sample_order(self):
         Generate = load_generate()

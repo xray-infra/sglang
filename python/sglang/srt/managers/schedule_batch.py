@@ -98,7 +98,11 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.kv_hints import KvHintsEnvelope
+from sglang.srt.managers.kv_hints import (
+    CacheRetentionIntent,
+    KvHintsEnvelope,
+    parse_cache_retention_intents,
+)
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -1048,6 +1052,17 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
         self.kv_hints = kv_hints
+        self.cache_retention_intents: tuple[CacheRetentionIntent, ...] = ()
+        self.cache_retention_error: Optional[str] = None
+        try:
+            self.cache_retention_intents = parse_cache_retention_intents(
+                kv_hints, prompt_token_count=len(self.origin_input_ids)
+            )
+        except ValueError as exc:
+            # Scheduler request construction must not let malformed optional
+            # metadata crash the worker. The scheduler turns this into a normal
+            # client-visible 400 before admission.
+            self.cache_retention_error = str(exc)
         self.lora_id = lora_id
         self.routing_key = routing_key
 
