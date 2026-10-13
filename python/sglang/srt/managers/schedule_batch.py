@@ -1244,6 +1244,10 @@ class Req(ReqDllmMixin):
         self.cached_tokens = 0
         self.cache_write_tokens: Optional[int] = None
         self.cache_write_tokens_by_ttl: Optional[Dict[int, int]] = None
+        # Radix insertion can precede asynchronous L3 retention commit. Keep
+        # real adopted prompt ranges private until the executor reports durable
+        # success; enqueue/tree insertion alone must never become billable usage.
+        self.cache_write_candidate_ranges: list[tuple[int, int]] = []
         # Set by the retention executor only after it accepts and resolves
         # retain-prefix actions to post-template token boundaries. Keys are
         # retention durations in seconds; values are cumulative prefix lengths.

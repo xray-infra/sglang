@@ -960,27 +960,44 @@ class UnifiedRadixCache(BasePrefixCache):
         if req.cache_write_tokens is None:
             req.cache_write_tokens = 0
             req.cache_write_tokens_by_ttl = {
-                ttl_seconds: 0
-                for ttl_seconds in req.cache_retention_applied_prefix_lens
+                duration_seconds: 0
+                for duration_seconds in req.cache_retention_applied_prefix_lens
             }
+
+    @staticmethod
+    def _merge_token_ranges(
+        ranges: list[tuple[int, int]], *, limit: int
+    ) -> list[tuple[int, int]]:
+        clipped = sorted(
+            (max(start, 0), min(end, limit))
+            for start, end in ranges
+            if start < limit and end > 0
+        )
+        merged: list[tuple[int, int]] = []
+        for start, end in clipped:
+            if start >= end:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
 
     @classmethod
     def _record_prompt_cache_write(
         cls, req: Req, result: InsertResult, inserted_len: int
     ) -> None:
-        """Record prompt tokens actually adopted by a completed tree insert.
+        """Remember real adopted prompt ranges until L3 retention commits.
 
-        ``adopted_ranges`` records both new leaves and evicted/component data
-        restored from this request's fresh KV.  Count the union once, clip it to
-        the prompt, and exclude generated-token KV from prompt billing.
+        Radix insertion normally finishes before asynchronous external storage.
+        Storing candidates here preserves the real creation evidence without
+        exposing it as usage. :meth:`finalize_cache_retention_usage` publishes
+        only the subset covered by durable applied retention boundaries.
         """
-        applied_prefix_lens = getattr(
-            req, "cache_retention_applied_prefix_lens", None
-        )
-        if not cls._requests_cache_retention(req) or not applied_prefix_lens:
+        if not cls._requests_cache_retention(req):
             return
 
-        prompt_len = min(len(req.origin_input_ids), max(applied_prefix_lens.values()))
+        prompt_len = len(req.origin_input_ids)
         if result.adopted_ranges is None:
             ranges = [(result.prefix_len, inserted_len)]
         else:
@@ -989,21 +1006,36 @@ class UnifiedRadixCache(BasePrefixCache):
                 for component_ranges in result.adopted_ranges.values()
                 for token_range in component_ranges
             ]
+        candidates = getattr(req, "cache_write_candidate_ranges", None)
+        if candidates is None:
+            candidates = []
+            req.cache_write_candidate_ranges = candidates
+        candidates.extend(cls._merge_token_ranges(ranges, limit=prompt_len))
 
-        clipped = sorted(
-            (max(start, 0), min(end, prompt_len))
-            for start, end in ranges
-            if start < prompt_len and end > 0
+    @classmethod
+    def finalize_cache_retention_usage(
+        cls, req: Req, applied_prefix_lens: dict[int, int]
+    ) -> None:
+        """Publish cache-creation usage after durable retention succeeds.
+
+        ``applied_prefix_lens`` maps generic retention durations in seconds to
+        cumulative worker-token boundaries acknowledged by every required
+        pool/rank. An empty result is an explicit zero, not an unknown value.
+        """
+        req.cache_retention_applied_prefix_lens = dict(applied_prefix_lens)
+        # Completion notifications may be replayed across scheduler/rank sync;
+        # recompute from immutable candidate evidence so finalization is idempotent.
+        req.cache_write_tokens = 0
+        req.cache_write_tokens_by_ttl = {
+            duration_seconds: 0 for duration_seconds in applied_prefix_lens
+        }
+        if not applied_prefix_lens:
+            return
+
+        prompt_len = min(len(req.origin_input_ids), max(applied_prefix_lens.values()))
+        merged = cls._merge_token_ranges(
+            getattr(req, "cache_write_candidate_ranges", []), limit=prompt_len
         )
-        merged = []
-        for start, end in clipped:
-            if start >= end:
-                continue
-            if merged and start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-            else:
-                merged.append((start, end))
-
         cache_read_end = min(req.cached_tokens, prompt_len)
 
         def count_overlap(range_start: int, range_end: int) -> int:
@@ -1012,29 +1044,28 @@ class UnifiedRadixCache(BasePrefixCache):
                 for start, end in merged
             )
 
-        cls._initialize_cache_write_counters(req)
         write_tokens_by_ttl = req.cache_write_tokens_by_ttl
         assert write_tokens_by_ttl is not None
         cursor = cache_read_end
         written = 0
-        # Longer TTL wins when two policies terminate at the same boundary.
+        # Longer retention wins when two policies terminate at one boundary.
         boundaries = sorted(
             (
-                (min(max(prefix_len, cache_read_end), prompt_len), ttl_seconds)
-                for ttl_seconds, prefix_len in applied_prefix_lens.items()
+                (min(max(prefix_len, cache_read_end), prompt_len), duration_seconds)
+                for duration_seconds, prefix_len in applied_prefix_lens.items()
             ),
             key=lambda item: (item[0], -item[1]),
         )
-        for boundary, ttl_seconds in boundaries:
+        for boundary, duration_seconds in boundaries:
             if boundary <= cursor:
                 continue
             interval_written = count_overlap(cursor, boundary)
-            write_tokens_by_ttl[ttl_seconds] = (
-                write_tokens_by_ttl.get(ttl_seconds, 0) + interval_written
+            write_tokens_by_ttl[duration_seconds] = (
+                write_tokens_by_ttl.get(duration_seconds, 0) + interval_written
             )
             written += interval_written
             cursor = boundary
-        req.cache_write_tokens = (req.cache_write_tokens or 0) + written
+        req.cache_write_tokens = written
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):

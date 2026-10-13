@@ -24,16 +24,20 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
             cache_write_tokens=None,
             cache_write_tokens_by_ttl=None,
             cached_tokens=0,
-            cache_retention_applied_prefix_lens={300: prompt_len},
+            cache_write_candidate_ranges=[],
+            cache_retention_applied_prefix_lens={},
             kv_hints=KvHintsEnvelope(
-                protocol_version="1.0",
+                protocol_version="0.1",
                 message_id="test",
                 actions=[
                     KvHintAction(
                         action_id="retain",
                         action_type="kv.retain_prefix",
                         action_version="1.0",
-                        payload={"ttl_seconds": 300},
+                        payload={
+                            "duration_seconds": 300,
+                            "prefix_token_count": prompt_len,
+                        },
                     )
                 ],
             ),
@@ -49,6 +53,8 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
         )
 
         UnifiedRadixCache._record_prompt_cache_write(req, result, inserted_len=12)
+        self.assertIsNone(req.cache_write_tokens)
+        UnifiedRadixCache.finalize_cache_retention_usage(req, {300: 10})
 
         self.assertEqual(req.cache_write_tokens, 10)
         self.assertEqual(req.cache_write_tokens_by_ttl, {300: 10})
@@ -66,6 +72,8 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
 
         UnifiedRadixCache._record_prompt_cache_write(req, first, inserted_len=4)
         UnifiedRadixCache._record_prompt_cache_write(req, second, inserted_len=12)
+        self.assertIsNone(req.cache_write_tokens)
+        UnifiedRadixCache.finalize_cache_retention_usage(req, {300: 8})
 
         self.assertEqual(req.cache_write_tokens, 8)
         self.assertEqual(req.cache_write_tokens_by_ttl, {300: 8})
@@ -73,16 +81,34 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
     def test_cache_write_splits_applied_one_hour_and_five_minute_ranges(self):
         req = self._retained_req(12)
         req.cached_tokens = 2
-        req.cache_retention_applied_prefix_lens = {3600: 8, 300: 12}
         result = InsertResult(
             prefix_len=2,
             adopted_ranges={BASE_COMPONENT_TYPE: [(2, 12)]},
         )
 
         UnifiedRadixCache._record_prompt_cache_write(req, result, inserted_len=12)
+        UnifiedRadixCache.finalize_cache_retention_usage(req, {3600: 8, 300: 12})
 
         self.assertEqual(req.cache_write_tokens, 10)
         self.assertEqual(req.cache_write_tokens_by_ttl, {300: 4, 3600: 6})
+
+        UnifiedRadixCache.finalize_cache_retention_usage(req, {3600: 8, 300: 12})
+        self.assertEqual(req.cache_write_tokens, 10)
+        self.assertEqual(req.cache_write_tokens_by_ttl, {300: 4, 3600: 6})
+
+    def test_failed_retention_publishes_explicit_zero_not_candidates(self):
+        req = self._retained_req(8)
+        result = InsertResult(
+            prefix_len=0,
+            adopted_ranges={BASE_COMPONENT_TYPE: [(0, 8)]},
+        )
+
+        UnifiedRadixCache._record_prompt_cache_write(req, result, inserted_len=8)
+        UnifiedRadixCache.finalize_cache_retention_usage(req, {})
+
+        self.assertEqual(req.cache_write_tokens, 0)
+        self.assertEqual(req.cache_write_tokens_by_ttl, {})
+        self.assertEqual(req.cache_retention_applied_prefix_lens, {})
 
     def test_automatic_cache_write_is_not_reported_as_billable_creation(self):
         req = SimpleNamespace(
