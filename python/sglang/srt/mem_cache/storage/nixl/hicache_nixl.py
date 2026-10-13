@@ -1004,15 +1004,19 @@ class HiCacheNixl(HiCacheStorage):
 
             if ctx.is_zero_copy:
                 page_size = getattr(ctx.host_pool, "page_size", 1) or 1
-                if (
-                    transfer.host_indices is None
-                    or transfer.host_indices.numel() < page_size
-                ):
+                if transfer.host_indices is None:
+                    # KV-derived sidecars intentionally have no host indices
+                    # during the availability query: KV slots are allocated
+                    # only after the query has found a usable prefix. Probe
+                    # one canonical page to obtain the pool's immutable object
+                    # shape without fabricating transfer ownership or indices.
+                    sample_indices = torch.arange(page_size, dtype=torch.int64)
+                elif transfer.host_indices.numel() >= page_size:
+                    sample_indices = transfer.host_indices[:page_size]
+                else:
                     final_pages = 0
                     break
-                _, sample_sizes = ctx.host_pool.get_page_buffer_meta(
-                    transfer.host_indices[:page_size]
-                )
+                _, sample_sizes = ctx.host_pool.get_page_buffer_meta(sample_indices)
                 if len(sample_sizes) != key_multiplier:
                     final_pages = 0
                     break

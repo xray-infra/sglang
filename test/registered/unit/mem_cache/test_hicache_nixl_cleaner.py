@@ -76,12 +76,18 @@ class TestNixlFileQuery(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "counts must match"):
             cache._query_keys_exist(["one", "two"], [1])
 
-    def test_hybrid_exists_requires_complete_component_sizes(self):
+    def test_kv_sidecar_without_indices_requires_complete_component_sizes(self):
         cache = object.__new__(HiCacheNixl)
         pool_name = PoolName.DEEPSEEK_V4_C1
+        observed = {}
+
+        def get_page_buffer_meta(indices):
+            observed["sample_indices"] = indices.tolist()
+            return [1000], [149760]
+
         host_pool = SimpleNamespace(
             page_size=1,
-            get_page_buffer_meta=lambda _indices: ([1000], [149760]),
+            get_page_buffer_meta=get_page_buffer_meta,
         )
         cache.registered_pools = {pool_name: host_pool}
         cache._hybrid_pool_ctx = {
@@ -92,8 +98,6 @@ class TestNixlFileQuery(CustomTestCase):
         cache._get_hybrid_component_keys = lambda keys, _name, _multiplier: [
             f"{key}-c1" for key in keys
         ]
-        observed = {}
-
         def query(component_keys, expected_sizes):
             observed["keys"] = component_keys
             observed["sizes"] = expected_sizes
@@ -105,7 +109,7 @@ class TestNixlFileQuery(CustomTestCase):
             [
                 PoolTransfer(
                     name=pool_name,
-                    host_indices=torch.tensor([0, 1]),
+                    host_indices=None,
                     keys=["page-0", "page-1"],
                 )
             ],
@@ -115,6 +119,7 @@ class TestNixlFileQuery(CustomTestCase):
         self.assertEqual(result.extra_pool_hit_pages[pool_name], 1)
         self.assertEqual(observed["keys"], ["page-0-c1", "page-1-c1"])
         self.assertEqual(observed["sizes"], [149760, 149760])
+        self.assertEqual(observed["sample_indices"], [0])
 
     def test_trailing_pool_size_probe_uses_only_available_tail_indices(self):
         cache = object.__new__(HiCacheNixl)
