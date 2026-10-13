@@ -38,9 +38,10 @@ class TestCacheRetentionExecutor(TestCase):
         second = _Node(2, [5, 6, 7, 8], first)
         nodes = {0: root, 1: first, 2: second}
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.page_size = 4
         cache.tree_core = SimpleNamespace(
-            is_eagle=False, node_by_id=lambda node_id: nodes[node_id]
+            is_eagle=False,
+            page_size=4,
+            node_by_id=lambda node_id: nodes[node_id],
         )
         cache.match_prefix = lambda params: SimpleNamespace(
             full_kv_hit_length=len(params.key),
