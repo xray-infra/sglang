@@ -40,7 +40,9 @@ class _FakeOpenAIServingChat:
     def supports_native_reasoning_history(self):
         return self.native_reasoning_history
 
-    def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
+    def _generate_chat_stream(
+        self, adapted_request, processed_request, raw_request, **kwargs
+    ):
         async def _gen():
             for line in self.stream_lines:
                 yield line
@@ -306,18 +308,32 @@ class TestAnthropicServing(unittest.TestCase):
         ]
         self.assertEqual(sig_deltas, [])
 
-    def test_stream_usage_subtracts_cache_read_and_omits_final_input_tokens(self):
+    def test_stream_usage_subtracts_cache_read_and_creation(self):
         usage = {
             "prompt_tokens": 10,
             "completion_tokens": 0,
             "total_tokens": 10,
-            "prompt_tokens_details": {"cached_tokens": 4},
+            "prompt_tokens_details": {
+                "cached_tokens": 4,
+                "cache_write_tokens": 5,
+                "cache_creation_token_details": {
+                    "ephemeral_5m_input_tokens": 2,
+                    "ephemeral_1h_input_tokens": 3,
+                },
+            },
         }
         final_usage = {
             "prompt_tokens": 10,
             "completion_tokens": 2,
             "total_tokens": 12,
-            "prompt_tokens_details": {"cached_tokens": 4},
+            "prompt_tokens_details": {
+                "cached_tokens": 4,
+                "cache_write_tokens": 5,
+                "cache_creation_token_details": {
+                    "ephemeral_5m_input_tokens": 2,
+                    "ephemeral_1h_input_tokens": 3,
+                },
+            },
         }
         serving = self._serving(
             [
@@ -338,9 +354,19 @@ class TestAnthropicServing(unittest.TestCase):
             0
         ]
 
-        self.assertEqual(message_start["message"]["usage"]["input_tokens"], 6)
+        self.assertEqual(message_start["message"]["usage"]["input_tokens"], 1)
         self.assertEqual(
             message_start["message"]["usage"]["cache_read_input_tokens"], 4
+        )
+        self.assertEqual(
+            message_start["message"]["usage"]["cache_creation_input_tokens"], 5
+        )
+        self.assertEqual(
+            message_start["message"]["usage"]["cache_creation"],
+            {
+                "ephemeral_1h_input_tokens": 3,
+                "ephemeral_5m_input_tokens": 2,
+            },
         )
         self.assertNotIn("input_tokens", message_delta["usage"])
         self.assertEqual(message_delta["usage"]["output_tokens"], 2)
@@ -371,6 +397,46 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.usage.input_tokens, 6)
         self.assertEqual(anthropic_response.usage.output_tokens, 2)
         self.assertEqual(anthropic_response.usage.cache_read_input_tokens, 4)
+
+    def test_non_streaming_usage_maps_cache_creation_and_subtracts_it(self):
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 3,
+                        "cache_write_tokens": 5,
+                        "cache_creation_token_details": {
+                            "ephemeral_5m_input_tokens": 2,
+                            "ephemeral_1h_input_tokens": 3,
+                        },
+                    },
+                },
+            }
+        )
+
+        anthropic_response = self._serving()._convert_response(response)
+
+        self.assertEqual(anthropic_response.usage.input_tokens, 2)
+        self.assertEqual(anthropic_response.usage.cache_read_input_tokens, 3)
+        self.assertEqual(anthropic_response.usage.cache_creation_input_tokens, 5)
+        self.assertEqual(
+            anthropic_response.usage.cache_creation.ephemeral_5m_input_tokens, 2
+        )
+        self.assertEqual(
+            anthropic_response.usage.cache_creation.ephemeral_1h_input_tokens, 3
+        )
 
     def test_tool_result_search_result_content_is_flattened(self):
         request = AnthropicMessagesRequest.model_validate(
@@ -1247,7 +1313,7 @@ class TestAnthropicServing(unittest.TestCase):
 
         class _RaisingOpenAI(_FakeOpenAIServingChat):
             def _generate_chat_stream(
-                self, adapted_request, processed_request, raw_request
+                self, adapted_request, processed_request, raw_request, **kwargs
             ):
                 async def _gen():
                     raise ValueError("tokenization failed")

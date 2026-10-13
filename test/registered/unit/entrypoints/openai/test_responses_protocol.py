@@ -9,6 +9,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesResponse,
     UsageInfo,
 )
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -306,7 +307,9 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
                 completion_tokens=102,
                 total_tokens=113,
                 reasoning_tokens=7,
-                prompt_tokens_details=PromptTokensDetails(cached_tokens=3),
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=3, cache_write_tokens=5
+                ),
             ),
         )
         usage = resp.model_dump()["usage"]
@@ -315,9 +318,74 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
         self.assertEqual(usage["total_tokens"], 113)
         self.assertEqual(usage["output_tokens_details"]["reasoning_tokens"], 7)
         self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 3)
+        self.assertEqual(usage["input_tokens_details"]["cache_write_tokens"], 5)
         # Chat-style keys must be gone.
         self.assertNotIn("prompt_tokens", usage)
         self.assertNotIn("completion_tokens", usage)
+
+    def test_internal_cache_creation_details_are_not_on_openai_wire(self):
+        details = PromptTokensDetails.model_validate(
+            {
+                "cached_tokens": 1,
+                "cache_write_tokens": 2,
+                "cache_creation_token_details": {
+                    "ephemeral_5m_input_tokens": 2,
+                    "ephemeral_1h_input_tokens": 0,
+                },
+            }
+        )
+
+        payload = details.model_dump()
+
+        self.assertEqual(payload["cache_write_tokens"], 2)
+        self.assertNotIn("cache_creation_token_details", payload)
+
+    def test_usage_serializes_required_zero_cache_write_tokens(self):
+        request = ResponsesRequest(model="x", input="hi", store=False)
+        resp = ResponsesResponse.from_request(
+            request,
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="completed",
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=0, total_tokens=1),
+        )
+
+        usage = resp.model_dump()["usage"]
+
+        self.assertEqual(usage["input_tokens_details"]["cache_write_tokens"], 0)
+
+    def test_parallel_choices_count_cache_creation_once(self):
+        usage = UsageProcessor.calculate_response_usage(
+            [
+                {
+                    "meta_info": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 1,
+                        "cache_write_tokens": 8,
+                        "cache_write_tokens_by_ttl": {300: 6, 3600: 2},
+                    }
+                },
+                {
+                    "meta_info": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 2,
+                        "cache_write_tokens": 0,
+                        "cache_write_tokens_by_ttl": {300: 0, 3600: 0},
+                    }
+                },
+            ],
+            n_choices=2,
+            enable_cache_report=True,
+        )
+
+        self.assertEqual(usage.prompt_tokens, 10)
+        self.assertEqual(usage.completion_tokens, 3)
+        self.assertEqual(usage.prompt_tokens_details.cache_write_tokens, 8)
+        details = usage.prompt_tokens_details.cache_creation_token_details
+        self.assertEqual(details.ephemeral_5m_input_tokens, 6)
+        self.assertEqual(details.ephemeral_1h_input_tokens, 2)
 
     def test_only_sdk_known_efforts_echoed_so_streaming_event_validates(self):
         import openai.types.responses as ort

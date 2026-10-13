@@ -239,6 +239,10 @@ class ReqState:
     # For streaming output
     last_output_offset: int = 0
 
+    # Native cache creation performed by the hidden n>1 prewarm request.
+    cache_write_tokens_offset: Optional[int] = None
+    cache_write_tokens_by_ttl_offset: Optional[Dict[int, int]] = None
+
     # Accumulate text lazily so incremental streaming can emit the incoming
     # delta directly without rebuilding the full output prefix.
     text: str = ""
@@ -1937,7 +1941,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
 
-            # Cache the common prefix for parallel sampling
+            # Cache the common prefix for parallel sampling. Preserve the
+            # hidden request's native write accounting for the public request.
+            prewarm_cache_write_tokens = []
+            prewarm_cache_write_tokens_by_ttl = []
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
@@ -1954,7 +1961,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._init_req_state(tmp_obj)
                 request_rids.add(tmp_obj.rid)
                 await self._send_one_request(tokenized_obj)
-                await self._wait_one_response(tmp_obj, request).__anext__()
+                prewarm_response = await self._wait_one_response(
+                    tmp_obj, request
+                ).__anext__()
+                prewarm_cache_write_tokens.append(
+                    prewarm_response["meta_info"].get("cache_write_tokens")
+                )
+                prewarm_cache_write_tokens_by_ttl.append(
+                    prewarm_response["meta_info"].get("cache_write_tokens_by_ttl")
+                )
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -1971,6 +1986,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._init_req_state(tmp_obj)
                     request_rids.add(tmp_obj.rid)
                     state = self.rid_to_state[tmp_obj.rid]
+                    state.cache_write_tokens_offset = prewarm_cache_write_tokens[i]
+                    state.cache_write_tokens_by_ttl_offset = (
+                        prewarm_cache_write_tokens_by_ttl[i]
+                    )
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
@@ -2338,6 +2357,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
+                cache_write_tokens = getattr(recv_obj, "cache_write_tokens", None)
+                cache_write_tokens_by_ttl = getattr(
+                    recv_obj, "cache_write_tokens_by_ttl", None
+                )
                 meta_info.update(
                     {
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],
@@ -2345,6 +2368,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
+                native_cache_write_tokens = (
+                    cache_write_tokens[i] if cache_write_tokens is not None else None
+                )
+                prewarm_cache_write_tokens = state.cache_write_tokens_offset
+                if (
+                    native_cache_write_tokens is not None
+                    or prewarm_cache_write_tokens is not None
+                ):
+                    meta_info["cache_write_tokens"] = (
+                        (native_cache_write_tokens or 0)
+                        + (prewarm_cache_write_tokens or 0)
+                    )
+
+                native_by_ttl = (
+                    cache_write_tokens_by_ttl[i]
+                    if cache_write_tokens_by_ttl is not None
+                    else None
+                )
+                prewarm_by_ttl = state.cache_write_tokens_by_ttl_offset
+                if native_by_ttl is not None or prewarm_by_ttl is not None:
+                    merged_by_ttl = dict(prewarm_by_ttl or {})
+                    for ttl_seconds, token_count in (native_by_ttl or {}).items():
+                        merged_by_ttl[ttl_seconds] = (
+                            merged_by_ttl.get(ttl_seconds, 0) + token_count
+                        )
+                    meta_info["cache_write_tokens_by_ttl"] = merged_by_ttl
                 if (
                     recv_obj.weight_versions is not None
                     and (spans := recv_obj.weight_versions[i]) is not None

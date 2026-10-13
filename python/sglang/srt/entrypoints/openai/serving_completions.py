@@ -237,6 +237,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
         completion_tokens = {}
         reasoning_tokens = {}
         cached_tokens = {}
+        cache_write_tokens = {}
+        cache_write_tokens_by_ttl = {}
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
@@ -263,6 +265,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     "reasoning_tokens", 0
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                cache_write_tokens[index] = content["meta_info"].get(
+                    "cache_write_tokens"
+                )
+                cache_creation_details = content["meta_info"].get(
+                    "cache_write_tokens_by_ttl"
+                )
+                if cache_creation_details is not None:
+                    cache_write_tokens_by_ttl[index] = cache_creation_details
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
                 cached_tokens_details[index] = content["meta_info"].get(
@@ -474,6 +484,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     reasoning_tokens,
                     completion_tokens,
                     cached_tokens=cached_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    cache_write_tokens_by_ttl=cache_write_tokens_by_ttl,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )

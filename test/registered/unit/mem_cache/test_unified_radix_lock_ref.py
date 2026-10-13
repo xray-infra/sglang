@@ -7,6 +7,9 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
+from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+from sglang.srt.mem_cache.unified_cache.components import BASE_COMPONENT_TYPE
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -14,6 +17,91 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
+    @staticmethod
+    def _retained_req(prompt_len):
+        return SimpleNamespace(
+            origin_input_ids=array("q", range(prompt_len)),
+            cache_write_tokens=None,
+            cache_write_tokens_by_ttl=None,
+            cached_tokens=0,
+            cache_retention_applied_prefix_lens={300: prompt_len},
+            kv_hints=KvHintsEnvelope(
+                protocol_version="1.0",
+                message_id="test",
+                actions=[
+                    KvHintAction(
+                        action_id="retain",
+                        action_type="kv.retain_prefix",
+                        action_version="1.0",
+                        payload={"ttl_seconds": 300},
+                    )
+                ],
+            ),
+        )
+
+    def test_cache_write_counts_adopted_prompt_ranges_once(self):
+        req = self._retained_req(10)
+        result = InsertResult(
+            prefix_len=8,
+            adopted_ranges={
+                BASE_COMPONENT_TYPE: [(0, 4), (4, 12)],
+            },
+        )
+
+        UnifiedRadixCache._record_prompt_cache_write(req, result, inserted_len=12)
+
+        self.assertEqual(req.cache_write_tokens, 10)
+        self.assertEqual(req.cache_write_tokens_by_ttl, {300: 10})
+
+    def test_cache_write_excludes_generated_tokens_and_accumulates(self):
+        req = self._retained_req(8)
+        first = InsertResult(
+            prefix_len=0,
+            adopted_ranges={BASE_COMPONENT_TYPE: [(0, 4)]},
+        )
+        second = InsertResult(
+            prefix_len=4,
+            adopted_ranges={BASE_COMPONENT_TYPE: [(4, 12)]},
+        )
+
+        UnifiedRadixCache._record_prompt_cache_write(req, first, inserted_len=4)
+        UnifiedRadixCache._record_prompt_cache_write(req, second, inserted_len=12)
+
+        self.assertEqual(req.cache_write_tokens, 8)
+        self.assertEqual(req.cache_write_tokens_by_ttl, {300: 8})
+
+    def test_cache_write_splits_applied_one_hour_and_five_minute_ranges(self):
+        req = self._retained_req(12)
+        req.cached_tokens = 2
+        req.cache_retention_applied_prefix_lens = {3600: 8, 300: 12}
+        result = InsertResult(
+            prefix_len=2,
+            adopted_ranges={BASE_COMPONENT_TYPE: [(2, 12)]},
+        )
+
+        UnifiedRadixCache._record_prompt_cache_write(req, result, inserted_len=12)
+
+        self.assertEqual(req.cache_write_tokens, 10)
+        self.assertEqual(req.cache_write_tokens_by_ttl, {300: 4, 3600: 6})
+
+    def test_automatic_cache_write_is_not_reported_as_billable_creation(self):
+        req = SimpleNamespace(
+            origin_input_ids=array("q", range(8)),
+            cache_write_tokens=None,
+            cache_write_tokens_by_ttl=None,
+            cached_tokens=0,
+            cache_retention_applied_prefix_lens={},
+            kv_hints=None,
+        )
+        result = InsertResult(
+            prefix_len=0,
+            adopted_ranges={BASE_COMPONENT_TYPE: [(0, 8)]},
+        )
+
+        UnifiedRadixCache._record_prompt_cache_write(req, result, inserted_len=8)
+
+        self.assertIsNone(req.cache_write_tokens)
+
     def test_no_insert_without_last_node_skips_lock_release(self):
         cache = object.__new__(UnifiedRadixCache)
         cache.session = MagicMock()

@@ -34,6 +34,13 @@ class AnthropicErrorResponse(BaseModel):
     error: AnthropicError
 
 
+class AnthropicCacheCreation(BaseModel):
+    """Breakdown of cache-creation tokens by applied TTL."""
+
+    ephemeral_1h_input_tokens: NonNegativeInt
+    ephemeral_5m_input_tokens: NonNegativeInt
+
+
 class AnthropicUsage(BaseModel):
     """Token usage information.
 
@@ -46,6 +53,7 @@ class AnthropicUsage(BaseModel):
     output_tokens: Optional[NonNegativeInt] = None
     cache_creation_input_tokens: Optional[NonNegativeInt] = None
     cache_read_input_tokens: Optional[NonNegativeInt] = None
+    cache_creation: Optional[AnthropicCacheCreation] = None
 
 
 # ---------- Content blocks (discriminated by ``type``) ----------

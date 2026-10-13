@@ -744,7 +744,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.tokenizer_manager.server_args.enable_cache_report:
             return None
         return UsageProcessor._details_if_cached(
-            content["meta_info"].get("cached_tokens", 0)
+            content["meta_info"].get("cached_tokens", 0),
+            content["meta_info"].get("cache_write_tokens"),
+            content["meta_info"].get("cache_write_tokens_by_ttl"),
         )
 
     def _reported_prompt_tokens(self, meta_info: Dict[str, Any]) -> int:
@@ -1715,6 +1717,8 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
+        *,
+        include_internal_cache_creation_details: bool = False,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
         # Parsers for tool calls and reasoning
@@ -1733,6 +1737,8 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        cache_write_tokens = {}
+        cache_write_tokens_by_ttl = {}
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
@@ -1763,6 +1769,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     "reasoning_tokens", 0
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                cache_write_tokens[index] = content["meta_info"].get(
+                    "cache_write_tokens"
+                )
+                cache_creation_details = content["meta_info"].get(
+                    "cache_write_tokens_by_ttl"
+                )
+                if cache_creation_details is not None:
+                    cache_write_tokens_by_ttl[index] = cache_creation_details
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
                 cached_tokens_details[index] = content["meta_info"].get(
@@ -1953,6 +1967,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_tokens,
                     completion_tokens,
                     cached_tokens=cached_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    cache_write_tokens_by_ttl=cache_write_tokens_by_ttl,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                     image_tokens=total_image_tokens,
@@ -1966,7 +1982,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     usage=usage,
                 )
-                yield f"data: {usage_chunk.model_dump_json()}\n\n"
+                if (
+                    include_internal_cache_creation_details
+                    and usage.prompt_tokens_details is not None
+                    and usage.prompt_tokens_details.cache_creation_token_details
+                    is not None
+                ):
+                    usage_payload = json.loads(usage_chunk.model_dump_json())
+                    usage_payload["usage"]["prompt_tokens_details"][
+                        "cache_creation_token_details"
+                    ] = (
+                        usage.prompt_tokens_details.cache_creation_token_details.model_dump()
+                    )
+                    yield (
+                        f"data: {json.dumps(usage_payload, separators=(',', ':'))}\n\n"
+                    )
+                else:
+                    yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
         except ValueError as e:
             if not stream_started:

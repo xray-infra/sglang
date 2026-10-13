@@ -1564,6 +1564,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
+    # Prompt tokens newly committed by the native prefix-cache insert path.
+    cache_write_tokens: Optional[List[Optional[int]]] = None
+    cache_write_tokens_by_ttl: Optional[List[Optional[Dict[int, int]]]] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1657,6 +1661,10 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Prompt tokens newly committed by the native prefix-cache insert path.
+    cache_write_tokens: Optional[List[Optional[int]]] = None
+    cache_write_tokens_by_ttl: Optional[List[Optional[Dict[int, int]]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

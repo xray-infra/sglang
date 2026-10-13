@@ -1223,8 +1223,16 @@ class Req(ReqDllmMixin):
         )
         self.grammar_wait_ct = 0
 
-        # The number of cached tokens that were already cached in the KV cache
+        # The number of prompt tokens read from and newly written to the KV cache.
+        # cache_write_tokens is updated only from successful radix insert results;
+        # it must never be inferred from a prompt miss or requested TTL.
         self.cached_tokens = 0
+        self.cache_write_tokens: Optional[int] = None
+        self.cache_write_tokens_by_ttl: Optional[Dict[int, int]] = None
+        # Set by the retention executor only after it accepts and resolves
+        # retain-prefix actions to post-template token boundaries. Keys are
+        # retention durations in seconds; values are cumulative prefix lengths.
+        self.cache_retention_applied_prefix_lens: Dict[int, int] = {}
         self.already_computed = 0
 
         # Detailed breakdown of cached tokens by source (for HiCache)

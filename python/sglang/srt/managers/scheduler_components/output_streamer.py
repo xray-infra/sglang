@@ -338,6 +338,8 @@ class _GenerationStreamAccumulator:
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
     cached_tokens: list = field(default_factory=list)
+    cache_write_tokens: list = field(default_factory=list)
+    cache_write_tokens_by_ttl: list = field(default_factory=list)
     cached_tokens_details: list = field(
         default_factory=list
     )  # Detailed breakdown by cache source
@@ -493,6 +495,8 @@ class _GenerationStreamAccumulator:
                 else len(output_ids_)
             )
             self.cached_tokens.append(req.cached_tokens)
+            self.cache_write_tokens.append(req.cache_write_tokens)
+            self.cache_write_tokens_by_ttl.append(req.cache_write_tokens_by_ttl)
 
             # Collect detailed cache breakdown if available
             self.cached_tokens_details.append(self.get_cached_tokens_details(req))
@@ -715,6 +719,8 @@ class _GenerationStreamAccumulator:
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,
+            cache_write_tokens=self.cache_write_tokens,
+            cache_write_tokens_by_ttl=self.cache_write_tokens_by_ttl,
             cached_tokens_details=self.cached_tokens_details,
             image_tokens=self.image_tokens,
             audio_tokens=self.audio_tokens,

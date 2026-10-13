@@ -182,10 +182,23 @@ class CachedTokensDetails(BaseModel):
         return data
 
 
+class CacheCreationTokenDetails(BaseModel):
+    """Cache-creation token breakdown retained across streaming chunks."""
+
+    ephemeral_5m_input_tokens: int = 0
+    ephemeral_1h_input_tokens: int = 0
+
+
 class PromptTokensDetails(BaseModel):
     """Details about prompt tokens."""
 
     cached_tokens: int = 0
+    cache_write_tokens: Optional[int] = None
+    # Internal cross-protocol detail, following LiteLLM's established carrier.
+    # Excluded from OpenAI wire output and mapped by the Anthropic adapter.
+    cache_creation_token_details: Optional[CacheCreationTokenDetails] = Field(
+        default=None, exclude=True
+    )
     # Multimodal prompt token counts (only populated when present in the prompt)
     image_tokens: Optional[int] = None
     audio_tokens: Optional[int] = None
@@ -194,9 +207,14 @@ class PromptTokensDetails(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        # Drop multimodal fields when absent so text-only/cache-only responses
-        # keep the original {"cached_tokens": N} shape.
-        for key in ("image_tokens", "audio_tokens", "video_tokens"):
+        # Drop optional fields when absent so unsupported write accounting is
+        # not confused with an explicit zero-token cache creation.
+        for key in (
+            "cache_write_tokens",
+            "image_tokens",
+            "audio_tokens",
+            "video_tokens",
+        ):
             if data.get(key) is None:
                 data.pop(key, None)
         return data
@@ -1897,18 +1915,18 @@ class ResponsesResponse(BaseModel):
         """Emit the Responses usage shape, not the chat one UsageInfo carries."""
         if usage is None:
             return None
-        cached = (
-            usage.prompt_tokens_details.cached_tokens
-            if usage.prompt_tokens_details
-            else 0
-        )
+        details = usage.prompt_tokens_details
+        cached = details.cached_tokens if details else 0
+        cache_write = details.cache_write_tokens if details else None
+        # OpenAI Responses requires this field even when no write occurred or
+        # the backend did not expose write accounting.
+        input_details = {
+            "cached_tokens": cached,
+            "cache_write_tokens": cache_write or 0,
+        }
         return {
             "input_tokens": usage.prompt_tokens,
-            "input_tokens_details": {
-                "cached_tokens": cached,
-                # required (no default) in the SDK's InputTokensDetails model
-                "cache_write_tokens": 0,
-            },
+            "input_tokens_details": input_details,
             "output_tokens": usage.completion_tokens or 0,
             "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
             "total_tokens": usage.total_tokens,

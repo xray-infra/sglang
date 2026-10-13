@@ -90,21 +90,37 @@ def _cached_prompt_tokens(usage) -> int:
     return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
 
 
+def _cache_creation_prompt_tokens(usage) -> Optional[int]:
+    prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
+    return getattr(prompt_tokens_details, "cache_write_tokens", None)
+
+
+def _cache_creation_ttl_tokens(usage) -> tuple[Optional[int], Optional[int]]:
+    prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
+    details = getattr(prompt_tokens_details, "cache_creation_token_details", None)
+    return (
+        getattr(details, "ephemeral_5m_input_tokens", None),
+        getattr(details, "ephemeral_1h_input_tokens", None),
+    )
+
+
 def _anthropic_input_tokens(usage) -> int:
     prompt = getattr(usage, "prompt_tokens", 0) or 0
     cached = _cached_prompt_tokens(usage)
-    if cached > prompt:
+    created = _cache_creation_prompt_tokens(usage) or 0
+    cache_accounted = cached + created
+    if cache_accounted > prompt:
         # Upstream telemetry bug: cached cannot exceed the prompt it caches.
         # Clamping silently here would hide the discrepancy from billing
         # dashboards, so make it visible at WARNING level.
         logger.warning(
-            "Cached tokens (%d) exceed prompt tokens (%d); clamping "
-            "input_tokens to 0. This usually indicates an upstream "
-            "telemetry bug.",
-            cached,
+            "Cache-read plus cache-creation tokens (%d) exceed prompt tokens "
+            "(%d); clamping input_tokens to 0. This usually indicates an "
+            "upstream telemetry bug.",
+            cache_accounted,
             prompt,
         )
-    return max(prompt - cached, 0)
+    return max(prompt - cache_accounted, 0)
 
 
 def _anthropic_usage_from_openai(
@@ -120,12 +136,21 @@ def _anthropic_usage_from_openai(
             output_tokens=0 if include_output else None,
         )
 
-    usage_fields: dict[str, int] = {}
+    usage_fields: dict[str, Any] = {}
     cached_tokens = _cached_prompt_tokens(usage)
+    cache_creation_tokens = _cache_creation_prompt_tokens(usage)
+    cache_creation_5m, cache_creation_1h = _cache_creation_ttl_tokens(usage)
     if include_input:
         usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
         if cached_tokens:
             usage_fields["cache_read_input_tokens"] = cached_tokens
+        if cache_creation_tokens is not None:
+            usage_fields["cache_creation_input_tokens"] = cache_creation_tokens
+        if cache_creation_5m is not None and cache_creation_1h is not None:
+            usage_fields["cache_creation"] = {
+                "ephemeral_5m_input_tokens": cache_creation_5m,
+                "ephemeral_1h_input_tokens": cache_creation_1h,
+            }
     if include_output:
         usage_fields["output_tokens"] = (
             0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
@@ -844,7 +869,10 @@ class AnthropicServing:
     ) -> AsyncGenerator[str, None]:
         """Convert OpenAI chat stream to Anthropic event stream."""
         openai_stream = self.openai_serving_chat._generate_chat_stream(
-            adapted_request, processed_request, raw_request
+            adapted_request,
+            processed_request,
+            raw_request,
+            include_internal_cache_creation_details=True,
         )
 
         content_block_index = 0

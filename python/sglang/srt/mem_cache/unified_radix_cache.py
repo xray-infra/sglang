@@ -851,6 +851,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+            if (
+                getattr(req, "cache_retention_applied_prefix_lens", None)
+                and req.cache_write_tokens is None
+            ):
+                self._initialize_cache_write_counters(req)
             return
 
         if self.disable:
@@ -871,6 +876,7 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params = InsertParams(
                 prev_prefix_len=req.kv.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
+                track_adopted_ranges=True,
             )
 
             # components prepare insert data + return effective cache_len
@@ -906,6 +912,7 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.key = radix_key
             insert_params.value = values
             result = self.insert(insert_params)
+            self._record_prompt_cache_write(req, result, page_aligned_len)
 
             # Free unaligned tail (+ deferred truncation tail)
             ranges = [(page_aligned_len, len(kv_indices))]
@@ -913,6 +920,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 ranges.append((tail_free_start, len(kv_indices_full)))
             self.free_kv_row(req.kv, ranges)
         else:
+            if (
+                getattr(req, "cache_retention_applied_prefix_lens", None)
+                and req.cache_write_tokens is None
+            ):
+                self._initialize_cache_write_counters(req)
             self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
 
         # Synthetic profiling requests may own KV without locking a tree node.
@@ -936,6 +948,94 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 self.session_refs.register_session_ref(req)
 
+    @staticmethod
+    def _requests_cache_retention(req: Req) -> bool:
+        envelope = req.kv_hints
+        return envelope is not None and any(
+            action.action_type == "kv.retain_prefix" for action in envelope.actions
+        )
+
+    @staticmethod
+    def _initialize_cache_write_counters(req: Req) -> None:
+        if req.cache_write_tokens is None:
+            req.cache_write_tokens = 0
+            req.cache_write_tokens_by_ttl = {
+                ttl_seconds: 0
+                for ttl_seconds in req.cache_retention_applied_prefix_lens
+            }
+
+    @classmethod
+    def _record_prompt_cache_write(
+        cls, req: Req, result: InsertResult, inserted_len: int
+    ) -> None:
+        """Record prompt tokens actually adopted by a completed tree insert.
+
+        ``adopted_ranges`` records both new leaves and evicted/component data
+        restored from this request's fresh KV.  Count the union once, clip it to
+        the prompt, and exclude generated-token KV from prompt billing.
+        """
+        applied_prefix_lens = getattr(
+            req, "cache_retention_applied_prefix_lens", None
+        )
+        if not cls._requests_cache_retention(req) or not applied_prefix_lens:
+            return
+
+        prompt_len = min(len(req.origin_input_ids), max(applied_prefix_lens.values()))
+        if result.adopted_ranges is None:
+            ranges = [(result.prefix_len, inserted_len)]
+        else:
+            ranges = [
+                token_range
+                for component_ranges in result.adopted_ranges.values()
+                for token_range in component_ranges
+            ]
+
+        clipped = sorted(
+            (max(start, 0), min(end, prompt_len))
+            for start, end in ranges
+            if start < prompt_len and end > 0
+        )
+        merged = []
+        for start, end in clipped:
+            if start >= end:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+
+        cache_read_end = min(req.cached_tokens, prompt_len)
+
+        def count_overlap(range_start: int, range_end: int) -> int:
+            return sum(
+                max(0, min(end, range_end) - max(start, range_start))
+                for start, end in merged
+            )
+
+        cls._initialize_cache_write_counters(req)
+        write_tokens_by_ttl = req.cache_write_tokens_by_ttl
+        assert write_tokens_by_ttl is not None
+        cursor = cache_read_end
+        written = 0
+        # Longer TTL wins when two policies terminate at the same boundary.
+        boundaries = sorted(
+            (
+                (min(max(prefix_len, cache_read_end), prompt_len), ttl_seconds)
+                for ttl_seconds, prefix_len in applied_prefix_lens.items()
+            ),
+            key=lambda item: (item[0], -item[1]),
+        )
+        for boundary, ttl_seconds in boundaries:
+            if boundary <= cursor:
+                continue
+            interval_written = count_overlap(cursor, boundary)
+            write_tokens_by_ttl[ttl_seconds] = (
+                write_tokens_by_ttl.get(ttl_seconds, 0) + interval_written
+            )
+            written += interval_written
+            cursor = boundary
+        req.cache_write_tokens = (req.cache_write_tokens or 0) + written
+
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -958,6 +1058,7 @@ class UnifiedRadixCache(BasePrefixCache):
             prev_prefix_len=req.kv.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            track_adopted_ranges=True,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1003,6 +1104,7 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.key = radix_key
         insert_params.value = values
         result = self.insert(insert_params)
+        self._record_prompt_cache_write(req, result, page_aligned_len)
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
