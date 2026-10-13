@@ -54,6 +54,10 @@ from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.kv_hints import (
+    KvHintsEnvelope,
+    decode_kv_hints_envelope,
+)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalProcessorOutput,
@@ -351,6 +355,9 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
+    # Orchestrator metadata, not sampling parameters or retention acceptance.
+    kv_hints: Optional[Union[KvHintsEnvelope, Dict, List]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -411,7 +418,33 @@ class GenerateReqInput:
         else:
             self._normalize_batch_inputs()
 
+        self._normalize_kv_hints()
         self._validate_rid_uniqueness()
+
+    def _normalize_kv_hints(self):
+        if self.kv_hints is None:
+            return
+
+        def decode(value):
+            return None if value is None else decode_kv_hints_envelope(value)
+
+        if self.is_single:
+            self.kv_hints = decode(self.kv_hints)
+            return
+
+        num = self.batch_size * self.parallel_sample_num
+        if isinstance(self.kv_hints, list):
+            if len(self.kv_hints) == self.batch_size:
+                self.kv_hints = [decode(value) for value in self.kv_hints]
+                self.kv_hints = self.kv_hints * self.parallel_sample_num
+            elif len(self.kv_hints) == num:
+                self.kv_hints = [decode(value) for value in self.kv_hints]
+            else:
+                raise ValueError(
+                    "The length of kv_hints should equal the original or expanded batch size."
+                )
+        else:
+            self.kv_hints = [decode(self.kv_hints)] * num
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -952,6 +985,7 @@ class GenerateReqInput:
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
+            kv_hints=self.kv_hints[i] if self.kv_hints is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1067,6 +1101,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Append-only IPC field; old shorter messages decode with no hint.
+    kv_hints: Optional[KvHintsEnvelope] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

@@ -98,6 +98,7 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -973,6 +974,7 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        kv_hints: Optional[KvHintsEnvelope] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -1045,6 +1047,7 @@ class Req(ReqDllmMixin):
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
+        self.kv_hints = kv_hints
         self.lora_id = lora_id
         self.routing_key = routing_key
 
