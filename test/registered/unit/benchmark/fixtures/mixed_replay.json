@@ -1,0 +1,28 @@
+{
+  "synthetic": true,
+  "episodes": [
+    {"id": "agent", "label": "agent", "arrival_ms": 0, "turns": [
+      {"messages": [{"role": "user", "content": "Find a value."}], "max_output_tokens": 16, "wait_before_ms": 0},
+      {"messages": [{"role": "user", "content": "Synthetic tool result: value=7."}], "max_output_tokens": 16, "wait_before_ms": 160}
+    ]},
+    {"id": "active_cancel", "label": "cancel", "arrival_ms": 10, "turns": [
+      {"messages": [{"role": "user", "content": "Stop this stream."}], "max_output_tokens": 128, "wait_before_ms": 0, "cancel_after_ms": 100},
+      {"messages": [{"role": "user", "content": "This successor must not dispatch."}], "max_output_tokens": 8, "wait_before_ms": 0}
+    ]},
+    {"id": "short", "label": "short", "arrival_ms": 30, "turns": [
+      {"messages": [{"role": "user", "content": "Hello."}], "max_output_tokens": 8, "wait_before_ms": 0}
+    ]},
+    {"id": "long", "label": "long", "arrival_ms": 30, "turns": [
+      {"messages": [{"role": "user", "content": "Synthetic long input: abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz."}], "max_output_tokens": 1024, "wait_before_ms": 0}
+    ]},
+    {"id": "queued_cancel", "label": "cancel", "arrival_ms": 30, "turns": [
+      {"messages": [{"role": "user", "content": "Cancel while waiting for a client permit."}], "max_output_tokens": 8, "wait_before_ms": 0, "cancel_after_ms": 20}
+    ]},
+    {"id": "burst_a", "label": "burst", "arrival_ms": 30, "turns": [
+      {"messages": [{"role": "user", "content": "Burst A."}], "max_output_tokens": 8, "wait_before_ms": 0}
+    ]},
+    {"id": "burst_b", "label": "burst", "arrival_ms": 30, "turns": [
+      {"messages": [{"role": "user", "content": "Burst B."}], "max_output_tokens": 8, "wait_before_ms": 0}
+    ]}
+  ]
+}
