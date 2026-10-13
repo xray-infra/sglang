@@ -90,11 +90,9 @@ class StorageAttachment:
                 "policies updated.",
             )
 
-        # Apply policies before the controller attach, so the storage threads
-        # observe the new values as soon as they start.
-        self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
-
-        logger.info(f"Attaching HiCache storage backend: {storage_backend}")
+        # Parse and validate the complete backend configuration before changing
+        # any cache policy.  A malformed JSON/file or invalid timeout value is a
+        # rejected attach and must leave the currently running cache untouched.
         try:
             (
                 extra_config,
@@ -113,6 +111,11 @@ class StorageAttachment:
                 f"'{storage_backend_extra_config_json}': {e}",
             )
 
+        # Apply policies immediately before controller attach, so the storage
+        # threads observe the new values as soon as they start.
+        self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
+
+        logger.info(f"Attaching HiCache storage backend: {storage_backend}")
         try:
             prefetch_threshold = self.resolve_prefetch_threshold(prefetch_threshold)
             controller.attach_storage_backend(
