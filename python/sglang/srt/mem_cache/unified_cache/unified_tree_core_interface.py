@@ -174,6 +174,15 @@ class UnifiedTreeCoreInterface(ABC):
         """
         ...
 
+    def mark_external_cache_stored_path(
+        self, node_id: NodeId, until_node_id: NodeId
+    ) -> None:
+        """Publish the loaded path only after the native load completes."""
+        node = self.node_by_id(node_id)
+        while node.id != until_node_id:
+            node.external_cache_stored = True
+            node = node.parent
+
     @abstractmethod
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
