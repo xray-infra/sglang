@@ -1826,6 +1826,35 @@ class Scheduler(
             ]
         )
 
+    def _get_hicache_storage_identity_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Return diagnostic identity of the currently enabled Mooncake store."""
+        controller = getattr(
+            getattr(self, "tree_cache", None), "cache_controller", None
+        )
+        if controller is None or not getattr(controller, "enable_storage", False):
+            return None
+        backend = getattr(controller, "storage_backend", None)
+        if backend is None:
+            return None
+
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        if not isinstance(backend, MooncakeStore):
+            return None
+        config = getattr(backend, "config", None)
+        if (
+            config is None
+            or getattr(backend, "store", None) is None
+            or config.standalone_storage
+        ):
+            return None
+        return {
+            "config_prefix": backend.config_prefix,
+            "store_tenant": config.tenant_id,
+        }
+
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
 
@@ -1837,6 +1866,7 @@ class Scheduler(
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
+            "hicache_storage_identity_snapshot": self._get_hicache_storage_identity_snapshot(),
         }
 
         return result_dict
@@ -5033,6 +5063,9 @@ class Scheduler(
             draft_graph_memory_usage=draft_graph_memory_usage,
         )
         ret["startup_time"] = self.startup_time
+        ret["hicache_storage_identity_snapshot"] = (
+            self._get_hicache_storage_identity_snapshot()
+        )
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if get_exec().moe.elastic_ep_backend is not None:
