@@ -109,9 +109,7 @@ def parse_cache_retention_intents(
         prefix_token_count = _required_positive_int(
             action.payload, "prefix_token_count"
         )
-        duration_seconds = _required_positive_int(
-            action.payload, "duration_seconds"
-        )
+        duration_seconds = _required_positive_int(action.payload, "duration_seconds")
         if prefix_token_count > prompt_token_count:
             raise ValueError(
                 "kv.retain_prefix prefix_token_count exceeds the worker prompt "

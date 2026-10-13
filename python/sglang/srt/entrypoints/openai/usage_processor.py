@@ -99,9 +99,7 @@ class UsageProcessor:
                 for ttl_seconds in details
             }
             for ttl_seconds in ttl_values:
-                total_by_ttl[ttl_seconds] = total_by_ttl.get(
-                    ttl_seconds, 0
-                ) + max(
+                total_by_ttl[ttl_seconds] = total_by_ttl.get(ttl_seconds, 0) + max(
                     details.get(ttl_seconds, 0) for details in known_choice_details
                 )
         return total_by_ttl
@@ -128,9 +126,7 @@ class UsageProcessor:
                 for ttl_seconds in details
             }
             for ttl_seconds in ttl_values:
-                total_by_ttl[ttl_seconds] = total_by_ttl.get(
-                    ttl_seconds, 0
-                ) + max(
+                total_by_ttl[ttl_seconds] = total_by_ttl.get(ttl_seconds, 0) + max(
                     details.get(ttl_seconds, 0) for details in known_choice_details
                 )
         return total_by_ttl

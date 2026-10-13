@@ -40,7 +40,10 @@ from sglang.srt.utils.network import NetworkAddress
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import MmSpec, Server  # pyright: ignore[reportMissingImports]
+    from sglang.srt.rust_extensions._server import (  # pyright: ignore[reportMissingImports]
+        MmSpec,
+        Server,
+    )
 
 logger = logging.getLogger(__name__)
 

@@ -1991,9 +1991,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     usage_payload = json.loads(usage_chunk.model_dump_json())
                     usage_payload["usage"]["prompt_tokens_details"][
                         "cache_creation_token_details"
-                    ] = (
-                        usage.prompt_tokens_details.cache_creation_token_details.model_dump()
-                    )
+                    ] = usage.prompt_tokens_details.cache_creation_token_details.model_dump()
                     yield (
                         f"data: {json.dumps(usage_payload, separators=(',', ':'))}\n\n"
                     )

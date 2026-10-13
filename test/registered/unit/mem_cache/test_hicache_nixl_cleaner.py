@@ -98,6 +98,7 @@ class TestNixlFileQuery(CustomTestCase):
         cache._get_hybrid_component_keys = lambda keys, _name, _multiplier: [
             f"{key}-c1" for key in keys
         ]
+
         def query(component_keys, expected_sizes):
             observed["keys"] = component_keys
             observed["sizes"] = expected_sizes

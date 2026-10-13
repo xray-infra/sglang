@@ -190,9 +190,7 @@ def _handle_output_by_index(output, i):
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
-            cache_write_tokens=_extract_field_by_index(
-                output, "cache_write_tokens", i
-            ),
+            cache_write_tokens=_extract_field_by_index(output, "cache_write_tokens", i),
             cache_write_tokens_by_ttl=_extract_field_by_index(
                 output, "cache_write_tokens_by_ttl", i
             ),
@@ -317,9 +315,7 @@ def _handle_output_by_index(output, i):
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
-            cache_write_tokens=_extract_field_by_index(
-                output, "cache_write_tokens", i
-            ),
+            cache_write_tokens=_extract_field_by_index(output, "cache_write_tokens", i),
             cache_write_tokens_by_ttl=_extract_field_by_index(
                 output, "cache_write_tokens_by_ttl", i
             ),

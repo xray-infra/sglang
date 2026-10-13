@@ -5,13 +5,13 @@ from contextlib import nullcontext
 from typing import Any
 
 from sglang.srt.environ import envs
-
-from .nixl_retention import NixlFileRetention  # pyright: ignore[reportMissingImports]
 from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
     _BUCKET_MASK,
     BUCKET_HEX_CHARS,
     route_key,
 )
+
+from .nixl_retention import NixlFileRetention  # pyright: ignore[reportMissingImports]
 
 logger = logging.getLogger(__name__)
 

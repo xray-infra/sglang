@@ -1843,7 +1843,10 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual([tc.index for tc in tool_calls], [0, 1])
         self.assertEqual(
             [tc.function.arguments for tc in tool_calls],
-            [json.dumps({"location": "San Francisco"}), json.dumps({"location": "London"})],
+            [
+                json.dumps({"location": "San Francisco"}),
+                json.dumps({"location": "London"}),
+            ],
         )
         self.assertEqual(finish_reason["type"], "tool_calls")
 

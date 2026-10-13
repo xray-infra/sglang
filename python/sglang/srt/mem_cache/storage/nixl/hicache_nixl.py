@@ -22,7 +22,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
-from sglang.srt.mem_cache.storage.nixl.nixl_retention import NixlFileRetention  # pyright: ignore[reportMissingImports]
+from sglang.srt.mem_cache.storage.nixl.nixl_retention import (
+    NixlFileRetention,  # pyright: ignore[reportMissingImports]
+)
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager

@@ -829,9 +829,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
                     async for response in self._wait_one_response(obj, request):
-                        finish_reason = response.get("meta_info", {}).get("finish_reason")
-                        if (isinstance(finish_reason, dict)
-                                and finish_reason.get("type") != "abort"):
+                        finish_reason = response.get("meta_info", {}).get(
+                            "finish_reason"
+                        )
+                        if (
+                            isinstance(finish_reason, dict)
+                            and finish_reason.get("type") != "abort"
+                        ):
                             public_terminal_emitted = True
                         yield response
                 else:
@@ -840,11 +844,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ):
                         # Non-streaming batches yield one list[dict]. Inspect
                         # terminal metadata without changing the adapter contract.
-                        responses = response if isinstance(response, list) else [response]
+                        responses = (
+                            response if isinstance(response, list) else [response]
+                        )
                         for item in responses:
-                            finish_reason = item.get("meta_info", {}).get("finish_reason")
-                            if (isinstance(finish_reason, dict)
-                                    and finish_reason.get("type") != "abort"):
+                            finish_reason = item.get("meta_info", {}).get(
+                                "finish_reason"
+                            )
+                            if (
+                                isinstance(finish_reason, dict)
+                                and finish_reason.get("type") != "abort"
+                            ):
                                 public_terminal_emitted = True
                         yield response
         except BaseException as error:
@@ -2377,9 +2387,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     or prewarm_cache_write_tokens is not None
                 ):
                     meta_info["cache_write_tokens"] = (
-                        (native_cache_write_tokens or 0)
-                        + (prewarm_cache_write_tokens or 0)
-                    )
+                        native_cache_write_tokens or 0
+                    ) + (prewarm_cache_write_tokens or 0)
 
                 native_by_ttl = (
                     cache_write_tokens_by_ttl[i]

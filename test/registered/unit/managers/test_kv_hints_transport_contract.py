@@ -143,13 +143,14 @@ class KvHintsTransportContract(unittest.TestCase):
         )
 
         cases = {
-            "protocol_version": ({**envelope(), "protocol_version": "9.0"}, "protocol_version"),
+            "protocol_version": (
+                {**envelope(), "protocol_version": "9.0"},
+                "protocol_version",
+            ),
             "action_version": (
                 {
                     **envelope(),
-                    "actions": [
-                        {**envelope()["actions"][0], "action_version": "2.0"}
-                    ],
+                    "actions": [{**envelope()["actions"][0], "action_version": "2.0"}],
                 },
                 "action_version",
             ),
