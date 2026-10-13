@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
 import os
 import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.storage.nixl.nixl_retention import (  # pyright: ignore[reportMissingImports]
+    NixlFileRetention,
+    parse_group_key,
+)
 from sglang.srt.mem_cache.storage.nixl.nixl_routing import BUCKET_HEX_CHARS
 
 logger = logging.getLogger(__name__)
@@ -20,14 +21,6 @@ _DEFAULT_INTERVAL_SEC = 30.0
 _DEFAULT_RECHECK_GROUPS = 50
 _DEFAULT_HIGH_WATERMARK = 80.0
 _DEFAULT_LOW_WATERMARK = 70.0
-_RANK_SUFFIX_RE = re.compile(r"_(\d+)_(\d+)$")
-_KV_SUFFIXES = ("_k", "_v")
-_POOL_NAME_PATTERN = "|".join(
-    sorted((re.escape(pool.value) for pool in PoolName), key=len, reverse=True)
-)
-_HYBRID_COMPONENT_SUFFIX_RE = re.compile(
-    rf"_(?:{_POOL_NAME_PATTERN})(?:_(?:temporal|conv_\d+|[kv]|\d+))?$"
-)
 _BUCKET_NAME_RE = re.compile(rf"^[0-9a-f]{{{BUCKET_HEX_CHARS}}}$")
 
 
@@ -44,24 +37,8 @@ class _GroupInfo:
     base_dirs: set[str] = field(default_factory=set)
 
 
-def _parse_group_key(name: str) -> str:
-    """Return the logical cache-key group for one NIXL FILE object name.
-
-    The physical names are produced by ``HiCacheNixl._get_suffixed_key``,
-    ``HiCacheNixl._get_key_list_from_meta``, and
-    ``HiCacheNixl._get_hybrid_component_keys``.
-    """
-    stem = name
-    stem = _HYBRID_COMPONENT_SUFFIX_RE.sub("", stem)
-    for suffix in _KV_SUFFIXES:
-        if stem.endswith(suffix):
-            stem = stem[: -len(suffix)]
-            break
-
-    match = _RANK_SUFFIX_RE.search(stem)
-    if match is not None:
-        stem = stem[: match.start()]
-    return stem
+# Kept as a private alias for existing cleaner callers/tests.
+_parse_group_key = parse_group_key
 
 
 def _safe_unlink(path: str) -> tuple[bool, int]:
@@ -94,7 +71,8 @@ class HiCacheL3Cleaner:
         low_watermark: float = _DEFAULT_LOW_WATERMARK,
         interval_sec: float = _DEFAULT_INTERVAL_SEC,
         recheck_groups: int = _DEFAULT_RECHECK_GROUPS,
-        unlink_workers: Optional[int] = None,
+        unlink_workers: int | None = None,
+        retention: NixlFileRetention | None = None,
     ) -> None:
         if isinstance(storage_dirs, str):
             storage_dirs = [storage_dirs] if storage_dirs else []
@@ -107,6 +85,9 @@ class HiCacheL3Cleaner:
         self.unlink_workers = unlink_workers or max(
             8, 8 * max(len(self.storage_dirs), 1)
         )
+        self.retention = retention or (
+            NixlFileRetention(self.storage_dirs) if self.storage_dirs else None
+        )
 
         if self.low_watermark >= self.high_watermark:
             raise ValueError(
@@ -116,7 +97,7 @@ class HiCacheL3Cleaner:
             )
 
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         """Start the cleaner thread on TP rank 0."""
@@ -189,25 +170,23 @@ class HiCacheL3Cleaner:
         deleted_files = 0
         bytes_deleted = 0
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.unlink_workers,
-            thread_name_prefix="hicache-l3-unlink",
-        ) as pool:
-            idx = 0
-            while idx < len(ordered) and not self._stop.is_set():
-                batch = ordered[idx : idx + self.recheck_groups]
-                paths = list(self._iter_group_paths(batch))
-                for removed, removed_bytes in pool.map(_safe_unlink, paths):
-                    if removed:
-                        deleted_files += 1
-                        bytes_deleted += removed_bytes
-                deleted_groups += len(batch)
-                idx += len(batch)
+        idx = 0
+        while idx < len(ordered) and not self._stop.is_set():
+            batch = ordered[idx : idx + self.recheck_groups]
+            for group in batch:
+                if self.retention is None:
+                    continue
+                result = self.retention.reclaim_group(group.base_key)
+                if result.reclaimed:
+                    deleted_groups += 1
+                    deleted_files += result.removed_files
+                    bytes_deleted += result.removed_bytes
+            idx += len(batch)
 
-                if all(
-                    self._disk_usage_pct(path) < self.low_watermark for path in hot_dirs
-                ):
-                    break
+            if all(
+                self._disk_usage_pct(path) < self.low_watermark for path in hot_dirs
+            ):
+                break
 
         final_pcts = {path: self._disk_usage_pct(path) for path in self.storage_dirs}
         logger.info(
@@ -268,12 +247,3 @@ class HiCacheL3Cleaner:
             group.base_dirs.add(base_dir)
             group.size += stat.st_size
             group.mtime = max(group.mtime, stat.st_mtime)
-
-    def _iter_group_paths(self, groups: Iterable[_GroupInfo]) -> Iterable[str]:
-        seen: set[str] = set()
-        for group in groups:
-            for path in sorted(group.paths):
-                if path in seen:
-                    continue
-                seen.add(path)
-                yield path

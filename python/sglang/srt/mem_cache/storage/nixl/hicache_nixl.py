@@ -2,6 +2,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -21,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
+from sglang.srt.mem_cache.storage.nixl.nixl_retention import NixlFileRetention  # pyright: ignore[reportMissingImports]
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
@@ -165,12 +167,27 @@ class HiCacheNixl(HiCacheStorage):
             else []
         )
         cleaner_config = nixlconfig.get_l3_cleaner_config()
+        retention = (
+            NixlFileRetention(
+                cleanup_dirs,
+                retention_supported=self.backend_selector.backend_name == "POSIX",
+                unsupported_reason=(
+                    f"backend {self.backend_selector.backend_name} does not declare "
+                    "POSIX flock semantics"
+                ),
+            )
+            if cleanup_dirs and cleaner_config["enabled"]
+            else None
+        )
+        if self.file_manager is not None:
+            self.file_manager.set_retention(retention)
         self._l3_cleaner: Optional[HiCacheL3Cleaner] = (
             HiCacheL3Cleaner(
                 cleanup_dirs,
                 tp_rank,
                 high_watermark=cleaner_config["high_watermark"],
                 low_watermark=cleaner_config["low_watermark"],
+                retention=retention,
             )
             if (
                 cleanup_dirs
@@ -275,6 +292,7 @@ class HiCacheNixl(HiCacheStorage):
         host_buffers: List[tuple],
         keys: List[str],
         direction: str,
+        retention_duration_seconds: float | None = None,
     ) -> bool:
         """Run a transfer where the host side is already pre-registered.
 
@@ -286,6 +304,21 @@ class HiCacheNixl(HiCacheStorage):
             logger.error("Mismatch between number of host buffers and keys")
             return False
 
+        retention = self.file_manager.retention if self.file_manager else None
+        if retention_duration_seconds is not None:
+            if self.backend_selector.mem_type != "FILE":
+                raise RuntimeError(
+                    "NIXL retention is unsupported for non-FILE backends"
+                )
+            if retention is None:
+                raise RuntimeError(
+                    "NIXL FILE retention is unsupported when the built-in cleaner "
+                    "is disabled or an external cleaner is configured"
+                )
+            retention_duration_seconds = retention.validate_retained_write(
+                keys, retention_duration_seconds
+            )
+
         host_descs = self.agent.get_xfer_descs(
             [(addr, size, 0) for (addr, size) in host_buffers], "DRAM"
         )
@@ -293,10 +326,17 @@ class HiCacheNixl(HiCacheStorage):
             logger.error("Failed to build host xfer descs")
             return False
 
-        with self.registry.storage(host_buffers, keys, direction) as storage_descs:
-            if storage_descs is None:
-                return False
-            return self._xfer_and_wait(host_descs, storage_descs, direction)
+        guard = (
+            retention.transfer_guard(keys) if retention is not None else nullcontext()
+        )
+        with guard:
+            with self.registry.storage(host_buffers, keys, direction) as storage_descs:
+                if storage_descs is None:
+                    return False
+                success = self._xfer_and_wait(host_descs, storage_descs, direction)
+            if success and retention_duration_seconds is not None:
+                retention.publish_deadlines(keys, retention_duration_seconds)
+            return success
 
     def get(
         self,
@@ -743,16 +783,37 @@ class HiCacheNixl(HiCacheStorage):
         key_list = [self._get_suffixed_key(key) for key in keys]
         return key_list, host_buffers
 
+    @staticmethod
+    def _retention_duration(
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> float | None:
+        if extra_info is None:
+            return None
+        direct_value = getattr(extra_info, "retention_duration_seconds", None)
+        if direct_value is not None:
+            return direct_value
+        if extra_info.extra_info is None:
+            return None
+        return extra_info.extra_info.get("retention_duration_seconds")
+
     def _batch_xfer(
         self,
         keys: List[str],
         key_strs: List[str],
         host_buffers: List[tuple],
         direction: str,
+        retention_duration_seconds: float | None = None,
     ) -> List[bool]:
         """Run a batch READ or WRITE for the v1 path against the pre-registered
         host region (no per-transfer host registration).
         """
+        if retention_duration_seconds is not None and direction != "WRITE":
+            raise ValueError("NIXL retention is valid only for FILE writes")
+        if (
+            retention_duration_seconds is not None
+            and self.backend_selector.mem_type != "FILE"
+        ):
+            raise RuntimeError("NIXL retention is unsupported for non-FILE backends")
         if not key_strs or not host_buffers:
             return [False] * len(keys)
 
@@ -762,7 +823,12 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.backend_selector.mem_type == "FILE":
             file_paths = [self.file_manager.get_file_path(key) for key in key_strs]
-            success = self._xfer_pre_registered(host_buffers, file_paths, direction)
+            success = self._xfer_pre_registered(
+                host_buffers,
+                file_paths,
+                direction,
+                retention_duration_seconds,
+            )
         else:  # mem_type == "OBJ"
             success = self._xfer_pre_registered(host_buffers, key_strs, direction)
 
@@ -868,7 +934,13 @@ class HiCacheNixl(HiCacheStorage):
             return [False] * len(keys)
 
         start_time = time.perf_counter()
-        results = self._batch_xfer(keys, key_strs, host_buffers, "WRITE")
+        results = self._batch_xfer(
+            keys,
+            key_strs,
+            host_buffers,
+            "WRITE",
+            self._retention_duration(extra_info),
+        )
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         self._log_xfer_stats(
             "batch_set_v1",
@@ -987,17 +1059,41 @@ class HiCacheNixl(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
         results: dict[str, List[bool]] = {}
-        for transfer in transfers:
-            _, key_strs, host_buffers, _, key_multiplier = self._prepare_pool_transfer(
-                transfer, for_write=True
-            )
+        prepared = [
+            (transfer, self._prepare_pool_transfer(transfer, for_write=True))
+            for transfer in transfers
+        ]
+        duration = self._retention_duration(extra_info)
+        if duration is not None:
+            if self.backend_selector.mem_type != "FILE" or self.file_manager is None:
+                raise RuntimeError(
+                    "NIXL retention is unsupported for non-FILE backends"
+                )
+            retention = self.file_manager.retention
+            if retention is None:
+                raise RuntimeError(
+                    "NIXL FILE retention is unsupported when the built-in cleaner "
+                    "is disabled or an external cleaner is configured"
+                )
+            all_paths = [
+                self.file_manager.get_file_path(key)
+                for _, (_, key_strs, _, _, _) in prepared
+                for key in key_strs
+            ]
+            retention.validate_retained_write(all_paths, duration)
+
+        for transfer, (_, key_strs, host_buffers, _, key_multiplier) in prepared:
             if not key_strs:
                 results[transfer.name] = [False] * len(transfer.keys or [])
                 continue
 
             start_time = time.perf_counter()
             transfer_results = self._batch_xfer(
-                key_strs, key_strs, host_buffers, "WRITE"
+                key_strs,
+                key_strs,
+                host_buffers,
+                "WRITE",
+                duration,
             )
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self._log_xfer_stats(

@@ -1,8 +1,12 @@
 import logging
 import os
-from typing import Optional
+import re
+from contextlib import nullcontext
+from typing import Any
 
 from sglang.srt.environ import envs
+
+from .nixl_retention import NixlFileRetention  # pyright: ignore[reportMissingImports]
 from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
     _BUCKET_MASK,
     BUCKET_HEX_CHARS,
@@ -10,6 +14,8 @@ from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
 )
 
 logger = logging.getLogger(__name__)
+
+_SAFE_FILE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 _SGLANG_NIXL_CONFIG_KEYS = {
     "use_direct_io",
@@ -22,7 +28,7 @@ _SGLANG_NIXL_CONFIG_KEYS = {
 class NixlBackendConfig:
     """Handles NIXL backend configurations"""
 
-    def __init__(self, config: Optional[dict[str, str]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         """Initialize backend configuration.
         Args:
             config: configurations in a dictionary. This config comes from --hicache-storage-backend-extra-config
@@ -73,6 +79,7 @@ class NixlBackendConfig:
         if "plugin" in self.config:
             # fully qualified form: {'plugin': { 'posix': {...}, 'gds': {...}, ...}}
             # choose the FIRST active plugin
+            plugin = "auto"
             for key, item in self.config["plugin"].items():
                 if item.get("active", False) in [True, "true", "True"]:
                     plugin = key.upper()
@@ -124,7 +131,7 @@ class NixlBackendSelection:
     OBJ_PLUGINS = ["OBJ"]  # Based on Amazon S3 SDK
 
     def __init__(
-        self, plugin: str = "auto", nixlconfig: Optional[NixlBackendConfig] = None
+        self, plugin: str = "auto", nixlconfig: NixlBackendConfig | None = None
     ):
         """Initialize backend selection.
         Args:
@@ -139,6 +146,8 @@ class NixlBackendSelection:
 
     def create_backend(self, agent) -> bool:
         """Create the appropriate NIXL backend based on configuration."""
+        plugin_list = []
+        initparams = {}
         try:
             plugin_list = agent.get_plugin_list()
             logger.debug(f"Available NIXL plugins: {plugin_list}")
@@ -216,11 +225,17 @@ class NixlFileManager:
                 Falls back to buffered I/O with a warning when O_DIRECT is unavailable.
         """
         if isinstance(base_dir, str):
-            self.base_dirs = [base_dir] if base_dir else []
+            configured_dirs = [base_dir] if base_dir else []
         else:
-            self.base_dirs = [d for d in base_dir if d]
+            configured_dirs = [d for d in base_dir if d]
+        self.base_dirs = list(
+            dict.fromkeys(
+                os.path.realpath(os.path.abspath(path)) for path in configured_dirs
+            )
+        )
         self.use_direct_io = use_direct_io
         self._created_bucket_dirs: set[str] = set()
+        self.retention: NixlFileRetention | None = None
         if not self.base_dirs:
             logger.debug(
                 f"Initialized file manager without a base directory. Direct I/O: {use_direct_io}"
@@ -233,23 +248,43 @@ class NixlFileManager:
                 f"Initialized file manager with base directories: {self.base_dirs}. Direct I/O: {use_direct_io}"
             )
 
+    def set_retention(self, retention: NixlFileRetention | None) -> None:
+        """Attach coordination shared with the built-in cleaner."""
+        self.retention = retention
+
     def clear(self) -> None:
-        """Clear all files below every configured base directory."""
+        """Clear cache files while preserving stable retention lock inodes."""
         if not self.base_dirs:
             logger.warning("Base directories are empty, skipping clear operation")
             return
 
-        for base in self.base_dirs:
-            try:
-                for root, _dirs, files in os.walk(base):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        try:
-                            os.remove(file_path)
-                        except OSError as e:
-                            logger.warning(f"Failed to remove file {file_path}: {e}")
-            except Exception as e:
-                logger.error(f"Failed to clear base directory {base}: {e}")
+        guard = self.retention.clear_guard() if self.retention else nullcontext()
+        with guard:
+            metadata_dir = self.retention.metadata_dir if self.retention else None
+            for base in self.base_dirs:
+                try:
+                    for root, dirs, files in os.walk(base, followlinks=False):
+                        if metadata_dir and os.path.samefile(root, metadata_dir):
+                            dirs[:] = []
+                            continue
+                        if metadata_dir:
+                            dirs[:] = [
+                                name
+                                for name in dirs
+                                if os.path.join(root, name) != metadata_dir
+                            ]
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            try:
+                                os.remove(file_path)
+                            except OSError as e:
+                                logger.warning(
+                                    f"Failed to remove file {file_path}: {e}"
+                                )
+                except Exception as e:
+                    logger.error(f"Failed to clear base directory {base}: {e}")
+            if self.retention:
+                self.retention.clear_deadlines()
         logger.debug(f"Cleared all files in base directories: {self.base_dirs}")
 
     def ensure_all_bucket_dirs(self) -> None:
@@ -270,13 +305,42 @@ class NixlFileManager:
         return list(self.base_dirs)
 
     def get_file_path(self, key: str) -> str:
-        """Get full file path for a given key."""
+        """Get a canonical, contained file path for a safe storage key."""
         if not self.base_dirs:
             return key
+        if not isinstance(key, str) or _SAFE_FILE_COMPONENT_RE.fullmatch(key) is None:
+            raise ValueError(f"unsafe NIXL FILE key component: {key!r}")
         disk_idx, bucket = route_key(key, len(self.base_dirs))
-        return os.path.join(self.base_dirs[disk_idx], bucket, key)
+        path = os.path.join(self.base_dirs[disk_idx], bucket, key)
+        self._validate_path(path)
+        return path
 
-    def open_file(self, file_path: str, create: bool = False) -> Optional[int]:
+    def _validate_path(self, file_path: str) -> str:
+        candidate = os.path.abspath(file_path)
+        containing_root = next(
+            (
+                root
+                for root in self.base_dirs
+                if os.path.commonpath((root, candidate)) == root
+            ),
+            None,
+        )
+        if containing_root is None:
+            raise ValueError(f"NIXL FILE path escapes configured roots: {file_path}")
+        relative = os.path.relpath(candidate, containing_root)
+        current = containing_root
+        for component in relative.split(os.sep):
+            current = os.path.join(current, component)
+            if os.path.lexists(current) and os.path.islink(current):
+                raise ValueError(f"NIXL FILE path contains a symlink: {file_path}")
+        if (
+            os.path.commonpath((containing_root, os.path.realpath(candidate)))
+            != containing_root
+        ):
+            raise ValueError(f"NIXL FILE path escapes configured roots: {file_path}")
+        return candidate
+
+    def open_file(self, file_path: str, create: bool = False) -> int | None:
         """Open a file and return its file descriptor.
 
         If ``create`` is True, the file is created if it does not exist
@@ -288,13 +352,16 @@ class NixlFileManager:
         flags = os.O_RDWR | os.O_CREAT if create else os.O_RDWR
         if self.use_direct_io:
             if hasattr(os, "O_DIRECT"):
-                flags |= os.O_DIRECT
+                flags |= os.O_DIRECT  # type: ignore[attr-defined]
             else:
                 logger.warning(
                     "use_direct_io is True, but O_DIRECT is not available on "
                     "this system. Falling back to buffered I/O."
                 )
         try:
+            if self.base_dirs:
+                file_path = self._validate_path(file_path)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
             if create:
                 parent = os.path.dirname(file_path)
                 if parent and parent not in self._created_bucket_dirs:

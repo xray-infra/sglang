@@ -1,4 +1,5 @@
 """Unit tests for the NIXL FILE L3 cleaner."""
+# ruff: noqa: E402
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -6,13 +7,21 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import (
     HiCacheL3Cleaner,
     _parse_group_key,
     _safe_unlink,
+)
+from sglang.srt.mem_cache.storage.nixl.nixl_retention import (
+    MAX_RETAINED_PHYSICAL_OBJECTS,
+    NixlFileRetention,
 )
 from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
     NixlBackendConfig,
@@ -187,6 +196,222 @@ class TestHiCacheL3Cleaner(CustomTestCase):
 
         with self.assertRaises(ValueError):
             cfg.get_l3_cleaner_config()
+
+
+class TestNixlFileRetention(CustomTestCase):
+    """CPU/process coverage for bounded FILE retention coordination."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_retention_")
+        self.base_dirs = [
+            os.path.join(self.test_dir, "disk0"),
+            os.path.join(self.test_dir, "disk1"),
+        ]
+        self.file_manager = NixlFileManager(self.base_dirs, use_direct_io=False)
+        self.retention = NixlFileRetention(self.file_manager.iter_all_base_dirs())
+        self.file_manager.set_retention(self.retention)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _write(self, key: str, data: bytes = b"x") -> str:
+        path = self.file_manager.get_file_path(key)
+        with open(path, "wb") as output:
+            output.write(data)
+        return path
+
+    def test_concurrent_initialization_uses_one_stable_lock_inode(self):
+        fresh_dirs = [
+            os.path.join(self.test_dir, "fresh-disk0"),
+            os.path.join(self.test_dir, "fresh-disk1"),
+        ]
+        for path in fresh_dirs:
+            os.makedirs(path)
+        start = os.path.join(self.test_dir, "start")
+        code = """
+import os, sys, time
+from sglang.srt.mem_cache.storage.nixl.nixl_retention import NixlFileRetention
+while not os.path.exists(sys.argv[3]):
+    time.sleep(0.001)
+retention = NixlFileRetention(sys.argv[1:3])
+with open(sys.argv[4], "w") as output:
+    output.write(str(os.stat(retention.stripe_paths[0]).st_ino))
+"""
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join(sys.path)
+        results = [os.path.join(self.test_dir, f"init-{index}") for index in range(8)]
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-c", code, *fresh_dirs, start, result], env=env
+            )
+            for result in results
+        ]
+        for process in processes:
+            self.addCleanup(
+                lambda process=process: process.poll() is None and process.kill()
+            )
+        open(start, "w").close()
+        for process in processes:
+            process.wait(timeout=5)
+            self.assertEqual(process.returncode, 0)
+        inodes = []
+        for result in results:
+            with open(result) as input_file:
+                inodes.append(input_file.read())
+        self.assertEqual(len(set(inodes)), 1)
+
+    def test_expiry_reclaims_all_existing_and_new_pool_siblings(self):
+        original = self._write("page-a_model_0_2_kv_k")
+        with self.retention.transfer_guard([original]):
+            self.retention.publish_deadlines([original], 1, now=10)
+
+        # This sibling was absent when retention was first published. Reclaim
+        # must rescan every pool and disk while holding the group stripe.
+        sibling = self._write("page-a_model_1_2_deepseek_v4_c128_state")
+        result = self.retention.reclaim_group("page-a_model", now=12)
+
+        self.assertTrue(result.reclaimed)
+        self.assertEqual(result.removed_files, 2)
+        self.assertFalse(os.path.exists(original))
+        self.assertFalse(os.path.exists(sibling))
+        self.assertIsNone(self.retention.deadline_for_group("page-a_model"))
+
+    def test_renewal_keeps_max_deadline(self):
+        path = self._write("page-a_model_0_1")
+        with self.retention.transfer_guard([path]):
+            self.retention.publish_deadlines([path], 100, now=100)
+        with self.retention.transfer_guard([path]):
+            self.retention.publish_deadlines([path], 10, now=100)
+        self.assertEqual(self.retention.deadline_for_group("page-a_model"), 200)
+
+    def test_retained_write_has_no_expiry_gap(self):
+        path = self._write("page-a_model_0_1")
+        with self.retention.transfer_guard([path]):
+            self.retention.publish_deadlines([path], 1, now=1)
+
+        entered = threading.Event()
+
+        def retained_write():
+            with self.retention.transfer_guard([path]):
+                entered.set()
+                time.sleep(0.15)
+                self.retention.publish_deadlines([path], 100, now=10)
+
+        writer = threading.Thread(target=retained_write)
+        writer.start()
+        self.assertTrue(entered.wait(1))
+        result = self.retention.reclaim_group("page-a_model", now=10)
+        writer.join(1)
+
+        self.assertFalse(result.reclaimed)
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(self.retention.deadline_for_group("page-a_model"), 110)
+
+    def test_active_transfer_blocks_reclaim_in_subprocess(self):
+        path = self._write("page-a_model_0_1")
+        with self.retention.transfer_guard([path]):
+            self.retention.publish_deadlines([path], 1, now=1)
+        ready = os.path.join(self.test_dir, "ready")
+        code = """
+import sys, time
+from sglang.srt.mem_cache.storage.nixl.nixl_retention import NixlFileRetention
+retention = NixlFileRetention(sys.argv[1:3])
+with retention.transfer_guard([sys.argv[3]]):
+    open(sys.argv[4], 'w').close()
+    time.sleep(0.35)
+"""
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join(sys.path)
+        process = subprocess.Popen(
+            [sys.executable, "-c", code, *self.base_dirs, path, ready], env=env
+        )
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        deadline = time.time() + 3
+        while not os.path.exists(ready) and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(os.path.exists(ready))
+
+        started = time.monotonic()
+        result = self.retention.reclaim_group("page-a_model", now=3)
+        elapsed = time.monotonic() - started
+        process.wait(timeout=3)
+
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertTrue(result.reclaimed)
+        self.assertFalse(os.path.exists(path))
+
+    def test_clear_serializes_and_preserves_lock_inodes(self):
+        path = self._write("page-a_model_0_1")
+        lock_inodes = [os.stat(item).st_ino for item in self.retention.stripe_paths]
+        entered = threading.Event()
+
+        def active_transfer():
+            with self.retention.transfer_guard([path]):
+                entered.set()
+                time.sleep(0.15)
+
+        worker = threading.Thread(target=active_transfer)
+        worker.start()
+        self.assertTrue(entered.wait(1))
+        started = time.monotonic()
+        self.file_manager.clear()
+        worker.join(1)
+
+        self.assertGreaterEqual(time.monotonic() - started, 0.1)
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(
+            lock_inodes, [os.stat(item).st_ino for item in self.retention.stripe_paths]
+        )
+
+    def test_canonical_paths_and_traversal_and_symlink_rejection(self):
+        relative = os.path.relpath(self.base_dirs[0])
+        relative_manager = NixlFileManager(relative, use_direct_io=False)
+        self.assertTrue(os.path.isabs(relative_manager.base_dirs[0]))
+        with self.assertRaises(ValueError):
+            relative_manager.get_file_path("../escape")
+        with self.assertRaises(ValueError):
+            relative_manager.get_file_path("nested/name")
+
+        safe_path = relative_manager.get_file_path("safe-key")
+        bucket = os.path.dirname(safe_path)
+        shutil.rmtree(bucket)
+        os.symlink(self.test_dir, bucket)
+        with self.assertRaises(ValueError):
+            relative_manager.get_file_path("safe-key")
+
+    def test_limits_are_validated_before_mutation(self):
+        paths = [
+            f"/root/object-{index}"
+            for index in range(MAX_RETAINED_PHYSICAL_OBJECTS + 1)
+        ]
+        with self.assertRaises(ValueError):
+            self.retention.validate_retained_write(paths, 1)
+        for invalid in (0, -1, 86401, float("inf"), "10"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.retention.validate_retained_write(["/root/object"], invalid)
+        self.assertEqual(os.listdir(self.retention.deadline_dir), [])
+
+    def test_ordinary_fast_path_has_no_retention_metadata_access(self):
+        manager = NixlFileManager(
+            os.path.join(self.test_dir, "ordinary"), use_direct_io=False
+        )
+        path = manager.get_file_path("ordinary-key")
+        fd = manager.open_file(path, create=True)
+        self.assertIsNotNone(fd)
+        os.close(fd)
+        self.assertIsNone(manager.retention)
+        self.assertFalse(
+            os.path.exists(os.path.join(manager.base_dirs[0], ".sglang-nixl-retention"))
+        )
+
+    def test_external_or_non_posix_retention_is_explicitly_unsupported(self):
+        unsupported = NixlFileRetention(
+            self.base_dirs,
+            retention_supported=False,
+            unsupported_reason="external cleaner or non-POSIX backend",
+        )
+        with self.assertRaisesRegex(RuntimeError, "unsupported"):
+            unsupported.validate_retained_write(["object"], 1)
 
 
 if __name__ == "__main__":
