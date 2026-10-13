@@ -3,6 +3,8 @@
 //! (batch / control result / error), and the columnar batch decode into
 //! per-request [`ChunkEvent`]s.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -164,6 +166,17 @@ pub struct BatchHeader {
     pub hidden_reqlens: Vec<u32>,
     #[serde(default)]
     pub hidden_poslens: Vec<u32>,
+    /// Scheduler-reported cache hits. Cache accounting trails the original ABI so
+    /// headers from an older Python producer can omit all three columns.
+    #[serde(default)]
+    pub cache_read_tokens: Vec<u32>,
+    /// `None` means the scheduler did not report writes; `Some(0)` is an explicit
+    /// zero and must remain distinguishable through public usage serialization.
+    #[serde(default)]
+    pub cache_write_tokens: Vec<Option<u32>>,
+    /// Scheduler-reported write counts keyed by retention duration in seconds.
+    #[serde(default)]
+    pub cache_write_tokens_by_ttl: Vec<Option<BTreeMap<u32, u32>>>,
 }
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
@@ -275,6 +288,9 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || !per_req_ok(&h.out_tokids_lp_reqlens)
         || !per_req_ok(&h.in_tokids_lp_reqlens)
         || !per_req_ok(&h.hidden_reqlens)
+        || !per_req_ok(&h.cache_read_tokens)
+        || (!h.cache_write_tokens.is_empty() && h.cache_write_tokens.len() != n)
+        || (!h.cache_write_tokens_by_ttl.is_empty() && h.cache_write_tokens_by_ttl.len() != n)
     {
         reject!()
     }
@@ -448,6 +464,20 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
+            cache_usage: {
+                let read_tokens = h.cache_read_tokens.get(i).copied().unwrap_or(0);
+                let write_tokens = h.cache_write_tokens.get(i).copied().flatten();
+                let write_tokens_by_ttl = h.cache_write_tokens_by_ttl.get(i).cloned().flatten();
+                (read_tokens > 0 || write_tokens.is_some() || write_tokens_by_ttl.is_some()).then(
+                    || {
+                        Box::new(CacheUsage {
+                            read_tokens,
+                            write_tokens,
+                            write_tokens_by_ttl,
+                        })
+                    },
+                )
+            },
             extras,
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
@@ -551,6 +581,9 @@ pub struct ChunkEvent {
     pub finish_reason: Option<FinishReason>,
     /// Prompt token count for this request (constant across its chunks).
     pub prompt_tokens: u32,
+    /// Scheduler-authoritative cache usage for this chunk. Boxed so ordinary
+    /// no-cache decode frames retain the compact hot-path event layout.
+    pub cache_usage: Option<Box<CacheUsage>>,
     /// Decoded text **delta** for this chunk (empty in skip mode / on partial UTF-8),
     /// filled by the detok shard. `token_ids` doubles as `output_ids`;
     /// `completion_tokens` is this chunk's count.
@@ -560,6 +593,29 @@ pub struct ChunkEvent {
     /// Boxed to keep the common token/text/finish frame small at large decode
     /// batches (the decoder allocates it only when a column is non-empty).
     pub extras: Option<Box<ChunkExtras>>,
+}
+
+/// Scheduler-reported cache usage. Writes remain optional: unknown (`None`) is
+/// distinct from an explicitly reported zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheUsage {
+    pub read_tokens: u32,
+    pub write_tokens: Option<u32>,
+    pub write_tokens_by_ttl: Option<BTreeMap<u32, u32>>,
+}
+
+impl ChunkEvent {
+    pub fn cache_read_tokens(&self) -> u32 {
+        self.cache_usage
+            .as_deref()
+            .map_or(0, |usage| usage.read_tokens)
+    }
+
+    pub fn cache_write_tokens(&self) -> Option<u32> {
+        self.cache_usage
+            .as_deref()
+            .and_then(|usage| usage.write_tokens)
+    }
 }
 
 /// Logprob + hidden-state columns for a [`ChunkEvent`], allocated only when the
@@ -702,6 +758,106 @@ mod tests {
         // `has_extras` guard must skip the extras machinery entirely for every
         // request (this is the from-scheduler hot path — see `for_each_chunk`).
         assert!(events.iter().all(|e| e.extras.is_none()));
+        assert!(events.iter().all(|e| e.cache_usage.is_none()));
+    }
+
+    #[test]
+    fn decodes_cache_usage_none_zero_and_nonzero() {
+        use rmpv::Value;
+
+        let mut cols = vec![
+            Value::Array(vec![Value::from("a"), Value::from("b"), Value::from("c")]),
+            Value::Array(vec![Value::Nil, Value::Nil, Value::Nil]),
+            Value::Array(vec![
+                Value::from(4u32),
+                Value::from(5u32),
+                Value::from(6u32),
+            ]),
+            Value::Array(vec![
+                Value::from(0u32),
+                Value::from(0u32),
+                Value::from(0u32),
+            ]),
+        ];
+        cols.extend((0..12).map(|_| Value::Array(vec![])));
+        cols.push(Value::Array(vec![
+            Value::from(0u32),
+            Value::from(7u32),
+            Value::from(11u32),
+        ]));
+        cols.push(Value::Array(vec![
+            Value::Nil,
+            Value::from(0u32),
+            Value::from(9u32),
+        ]));
+        cols.push(Value::Array(vec![
+            Value::Nil,
+            Value::Map(vec![(Value::from(300u32), Value::from(0u32))]),
+            Value::Map(vec![
+                (Value::from(300u32), Value::from(2u32)),
+                (Value::from(3600u32), Value::from(3u32)),
+            ]),
+        ]));
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &Value::Array(cols)).unwrap();
+        let framed = frame_decode_batch_cols(&header, &[]);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&framed[1..], |event| events.push(event)).ok);
+
+        assert!(
+            events[0].cache_usage.is_none(),
+            "absent writes stay unknown"
+        );
+        let zero = events[1].cache_usage.as_deref().unwrap();
+        assert_eq!(zero.read_tokens, 7);
+        assert_eq!(zero.write_tokens, Some(0));
+        assert_eq!(
+            zero.write_tokens_by_ttl.as_ref().unwrap().get(&300),
+            Some(&0)
+        );
+        let nonzero = events[2].cache_usage.as_deref().unwrap();
+        assert_eq!(nonzero.read_tokens, 11);
+        assert_eq!(nonzero.write_tokens, Some(9));
+        assert_eq!(
+            nonzero.write_tokens_by_ttl.as_ref().unwrap().get(&300),
+            Some(&2)
+        );
+        assert_eq!(
+            nonzero.write_tokens_by_ttl.as_ref().unwrap().get(&3600),
+            Some(&3)
+        );
+    }
+
+    #[test]
+    fn rejects_partial_cache_usage_columns() {
+        use rmpv::Value;
+
+        for cache_column in 16..19 {
+            let mut cols = vec![
+                Value::Array(vec![Value::from("a"), Value::from("b")]),
+                Value::Array(vec![Value::Nil, Value::Nil]),
+                Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
+                Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
+            ];
+            cols.extend((0..12).map(|_| Value::Array(vec![])));
+            cols.extend([
+                Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
+                Value::Array(vec![Value::Nil, Value::Nil]),
+                Value::Array(vec![Value::Nil, Value::Nil]),
+            ]);
+            cols[cache_column] = Value::Array(vec![if cache_column == 16 {
+                Value::from(0u32)
+            } else {
+                Value::Nil
+            }]);
+            let mut header = Vec::new();
+            rmpv::encode::write_value(&mut header, &Value::Array(cols)).unwrap();
+            let framed = frame_decode_batch_cols(&header, &[]);
+            let mut routed = 0;
+            let decoded = for_each_chunk(&framed[1..], |_| routed += 1);
+            assert!(!decoded.ok, "partial cache column {cache_column} accepted");
+            assert_eq!(routed, 0);
+        }
     }
 
     /// A header whose column lengths exceed the data buffer (a Python/Rust

@@ -432,6 +432,10 @@ impl OutputAccumulator {
         o.token_ids.extend_from_slice(&d.token_ids); // token_ids doubles as output_ids
         o.completion_tokens += d.completion_tokens;
         o.prompt_tokens = d.prompt_tokens; // constant across the request
+        // Cache accounting is cumulative scheduler metadata, not a delta. The
+        // latest (and ultimately final) chunk is authoritative, including an
+        // explicit zero or a transition back to unknown.
+        o.cache_usage.clone_from(&d.cache_usage);
         if d.finish_reason.is_some() {
             o.finish_reason = d.finish_reason.clone();
         }
@@ -545,6 +549,41 @@ impl OutputAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::response::CacheUsage;
+
+    #[test]
+    fn accumulator_uses_latest_authoritative_cache_usage() {
+        let mut accumulator = OutputAccumulator::default();
+        accumulator.fold(&ChunkEvent {
+            cache_usage: Some(Box::new(CacheUsage {
+                read_tokens: 4,
+                write_tokens: Some(0),
+                write_tokens_by_ttl: Some([(300, 0)].into_iter().collect()),
+            })),
+            ..Default::default()
+        });
+        assert_eq!(accumulator.snapshot().cache_read_tokens(), 4);
+        assert_eq!(accumulator.snapshot().cache_write_tokens(), Some(0));
+
+        accumulator.fold(&ChunkEvent {
+            cache_usage: Some(Box::new(CacheUsage {
+                read_tokens: 8,
+                write_tokens: Some(5),
+                write_tokens_by_ttl: Some([(3600, 5)].into_iter().collect()),
+            })),
+            ..Default::default()
+        });
+        let usage = accumulator.snapshot().cache_usage.as_deref().unwrap();
+        assert_eq!(usage.read_tokens, 8);
+        assert_eq!(usage.write_tokens, Some(5));
+        assert_eq!(
+            usage.write_tokens_by_ttl.as_ref().unwrap().get(&3600),
+            Some(&5)
+        );
+
+        accumulator.fold(&ChunkEvent::default());
+        assert!(accumulator.snapshot().cache_usage.is_none());
+    }
 
     #[test]
     fn flat_logprob_tuples_shape() {
@@ -799,6 +838,7 @@ mod tests {
                     token_ids: vec![-2, 3],
                     completion_tokens: 2,
                     prompt_tokens: 4,
+                    cache_usage: None,
                     finish_reason: serde_json::from_value(
                         serde_json::json!({"type": "stop", "matched": 3}),
                     )

@@ -16,7 +16,7 @@ from array import array
 from itertools import chain
 from typing import TYPE_CHECKING, Any, List, Optional
 
-import msgspec
+import msgspec  # pyright: ignore[reportMissingImports]
 
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.utils import (
@@ -40,7 +40,7 @@ from sglang.srt.utils.network import NetworkAddress
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import MmSpec, Server
+    from sglang.srt.rust_extensions._server import MmSpec, Server  # pyright: ignore[reportMissingImports]
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +57,12 @@ class RustServer:
         server: Server,
         mm_spec: Optional[RustMmSpec] = None,
         max_per_poll: int = 256,
+        enable_cache_report: bool = False,
     ):
         self.server = server
         self.mm_spec = mm_spec
         self._max_per_poll = max_per_poll
+        self._enable_cache_report = enable_cache_report
 
     @classmethod
     def launch(cls, scheduler: Scheduler) -> RustServer:
@@ -109,7 +111,7 @@ class RustServer:
             # preempt the scheduler loop and inflate inter-token latency.
             if server_cores is not None:
                 try:
-                    os.sched_setaffinity(0, set(server_cores))
+                    os.sched_setaffinity(0, set(server_cores))  # pyright: ignore[reportAttributeAccessIssue]
                 except OSError as e:
                     logger.warning(
                         "rust server: cannot confine mm threads to server cores: %s", e
@@ -136,7 +138,7 @@ class RustServer:
         if launch_cores is not None:
             try:
                 # pid 0 == this thread (the scheduler event-loop / launch thread).
-                os.sched_setaffinity(0, set(launch_cores))
+                os.sched_setaffinity(0, set(launch_cores))  # pyright: ignore[reportAttributeAccessIssue]
             except OSError as e:
                 logger.warning("rust server: cannot pin scheduler launch thread: %s", e)
 
@@ -151,7 +153,11 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server, mm_spec=mm_spec)
+        return cls(
+            server,
+            mm_spec=mm_spec,
+            enable_cache_report=server_args.enable_cache_report,
+        )
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -254,10 +260,10 @@ class RustServer:
         bulk numeric columns never go through msgpack:
 
           - ``header``: msgpack ``BatchHeader`` positional array — the per-request
-            scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens``) plus
-            the shape metadata for the optional families (``*_lens`` element counts
-            for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
-            and hidden ones).
+            scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens``), the
+            shape metadata for the optional families (``*_lens`` element counts for
+            flat logprob columns, ``*_reqlens``/``*_poslens`` for ragged and hidden
+            ones), then the cache read/write accounting columns.
           - ``data``: the raw little-endian numeric buffer — every column is a
             4-byte element (``f32`` values, ``i32`` indices), concatenated in the
             order the Rust ``for_each_chunk`` reads them.
@@ -291,13 +297,42 @@ class RustServer:
         # always `array("i")` (never None) so `map(len)` and a bare
         # `chain.from_iterable` stay in C.
         rids = payload.rids
+        assert rids is not None
         finish_reasons = payload.finished_reasons
         tok_lens = list(map(len, output_ids))
         flat_ids = array("i", chain.from_iterable(output_ids))
 
+        batch_size = len(rids)
+        if self._enable_cache_report:
+            cache_read_tokens = payload.cached_tokens or []
+            cache_write_tokens = payload.cache_write_tokens
+            cache_write_tokens_by_ttl = payload.cache_write_tokens_by_ttl
+            assert len(cache_read_tokens) == batch_size, (
+                f"cache read column: {len(cache_read_tokens)} entries for a batch of {batch_size}"
+            )
+            if cache_write_tokens is None:
+                cache_write_tokens = [None] * batch_size
+            if cache_write_tokens_by_ttl is None:
+                cache_write_tokens_by_ttl = [None] * batch_size
+            assert len(cache_write_tokens) == batch_size, (
+                f"cache write column: {len(cache_write_tokens)} entries for a batch of {batch_size}"
+            )
+            assert len(cache_write_tokens_by_ttl) == batch_size, (
+                "cache write TTL column: "
+                f"{len(cache_write_tokens_by_ttl)} entries for a batch of {batch_size}"
+            )
+        else:
+            # Match the Python adapter contract: cache details are public only
+            # when --enable-cache-report is set. Empty trailing columns preserve
+            # the positional ABI and decode as absent on the Rust side.
+            cache_read_tokens = []
+            cache_write_tokens = []
+            cache_write_tokens_by_ttl = []
+
         # Column order here MUST match BatchHeader (header_cols) and
         # for_each_chunk's read order (data_cols); the extras contribution
-        # is ordered by the `extras` tuple below.
+        # is ordered by the `extras` tuple below. Cache columns are trailing so an
+        # older header that omits them still decodes with unknown write accounting.
         header_cols = [rids, finish_reasons, prompt_tokens, tok_lens]
         data_cols = [flat_ids.tobytes()]
 
@@ -312,7 +347,6 @@ class RustServer:
             # `tensor.tolist()`, so revisit whether the upstream values are
             # still contiguous tensors; if so, ship raw bytes + a shape
             # descriptor and skip the flatten entirely.
-            batch_size = len(rids)
             extras = (
                 FlatPairColumns(
                     "output_token_logprobs",
@@ -387,7 +421,17 @@ class RustServer:
             for extra in extras:
                 header_cols += extra.header_cols()
                 data_cols += extra.data_cols()
+        else:
+            # Cache accounting trails the pre-existing optional-family columns in
+            # the positional ABI. Empty placeholders preserve those positions
+            # without invoking any per-request extras work on the decode hot path.
+            header_cols += [[]] * 12
 
+        header_cols += [
+            cache_read_tokens,
+            cache_write_tokens,
+            cache_write_tokens_by_ttl,
+        ]
         header = msgspec.msgpack.encode(header_cols)
         # Pass the raw column list; the Rust side concatenates it into the frame
         # with the GIL released.

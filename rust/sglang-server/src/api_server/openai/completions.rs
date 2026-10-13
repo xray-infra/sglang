@@ -16,7 +16,7 @@ use axum::{
 };
 use dynamo_protocols::types::{
     Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
-    CreateCompletionResponse, Logprobs, Prompt, Stop,
+    CreateCompletionResponse, Logprobs, Prompt, PromptTokensDetails, Stop,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -369,6 +369,7 @@ pub(super) async fn unary_completion(
     let mut choices = Vec::with_capacity(submitted.len());
     let mut extensions = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = BTreeMap::<usize, u32>::new();
+    let mut cache_usage = BTreeMap::<usize, Vec<(u32, Option<u32>)>>::new();
     let mut completion_tokens = 0u64;
 
     for choice in submitted {
@@ -382,6 +383,10 @@ pub(super) async fn unary_completion(
         prompt_tokens
             .entry(choice.prompt_index)
             .or_insert(output.prompt_tokens);
+        cache_usage
+            .entry(choice.prompt_index)
+            .or_default()
+            .push((output.cache_read_tokens(), output.cache_write_tokens()));
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let (response_choice, extension) = completion_choice(
             choice.index,
@@ -402,9 +407,12 @@ pub(super) async fn unary_completion(
         .values()
         .copied()
         .fold(0u32, u32::saturating_add);
+    let (cache_read_tokens, cache_write_tokens) = aggregate_cache_usage(&cache_usage);
     let usage = completion_usage(
         prompt_tokens,
         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+        cache_read_tokens,
+        cache_write_tokens,
     );
 
     Json(completion_response_value(
@@ -529,6 +537,8 @@ pub(super) fn completion_event_stream(
         let mut echoes = Vec::with_capacity(count);
         let mut first_chunks = vec![true; count];
         let mut prompt_tokens_by_prompt = BTreeMap::<usize, u32>::new();
+        let mut cache_usage_by_prompt = BTreeMap::<usize, Vec<(u32, Option<u32>)>>::new();
+        let mut cache_usage_by_choice = vec![(0u32, None); count];
         let mut completion_tokens_by_choice = vec![0u64; count];
         let mut streams = Vec::with_capacity(count);
 
@@ -574,6 +584,8 @@ pub(super) fn completion_event_stream(
                 .or_insert(output.prompt_tokens);
             completion_tokens_by_choice[index] = completion_tokens_by_choice[index]
                 .saturating_add(output.completion_tokens);
+            cache_usage_by_choice[index] =
+                (output.cache_read_tokens(), output.cache_write_tokens());
             let first = std::mem::replace(&mut first_chunks[index], false);
             let text = if echo && first {
                 echoes[index].clone() + &output.text
@@ -584,6 +596,8 @@ pub(super) fn completion_event_stream(
                 completion_usage(
                     output.prompt_tokens,
                     u32::try_from(completion_tokens_by_choice[index]).unwrap_or(u32::MAX),
+                    output.cache_read_tokens(),
+                    output.cache_write_tokens(),
                 )
             });
             let (choice, extension) = completion_choice(
@@ -606,6 +620,12 @@ pub(super) fn completion_event_stream(
         }
 
         if include_usage {
+            for (index, usage) in cache_usage_by_choice.into_iter().enumerate() {
+                cache_usage_by_prompt
+                    .entry(prompt_indexes[index])
+                    .or_default()
+                    .push(usage);
+            }
             let prompt_tokens = prompt_tokens_by_prompt
                 .values()
                 .copied()
@@ -613,6 +633,8 @@ pub(super) fn completion_event_stream(
             let completion_tokens = completion_tokens_by_choice
                 .into_iter()
                 .fold(0u64, u64::saturating_add);
+            let (cache_read_tokens, cache_write_tokens) =
+                aggregate_cache_usage(&cache_usage_by_prompt);
             let final_chunk = CreateCompletionResponse {
                 id: response_id,
                 choices: vec![],
@@ -623,6 +645,8 @@ pub(super) fn completion_event_stream(
                 usage: Some(completion_usage(
                     prompt_tokens,
                     u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                    cache_read_tokens,
+                    cache_write_tokens,
                 )),
             };
             yield completion_response_value(final_chunk, &[]).to_string();
@@ -631,13 +655,54 @@ pub(super) fn completion_event_stream(
     }
 }
 
-pub(super) fn completion_usage(prompt_tokens: u32, completion_tokens: u32) -> CompletionUsage {
+pub(super) fn completion_usage(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: Option<u32>,
+) -> CompletionUsage {
+    let prompt_tokens_details =
+        (cache_read_tokens > 0 || cache_write_tokens.is_some()).then(|| {
+            // Deserialize through Dynamo's public wire type so this adapter does not
+            // introduce a second async-openai crate type merely to name the field.
+            serde_json::from_value::<PromptTokensDetails>(serde_json::json!({
+                "cached_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
+            }))
+            .expect("cache usage matches PromptTokensDetails schema")
+        });
     CompletionUsage {
         prompt_tokens,
         completion_tokens,
         total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        prompt_tokens_details,
         ..Default::default()
     }
+}
+
+/// Aggregate scheduler accounting like the Python OpenAI adapter: one cache-read
+/// value per logical prompt, and the maximum reported write across its `n` choices.
+/// Any unknown choice keeps the aggregate write unknown rather than fabricating 0.
+fn aggregate_cache_usage(
+    by_prompt: &BTreeMap<usize, Vec<(u32, Option<u32>)>>,
+) -> (u32, Option<u32>) {
+    let mut reads = 0u32;
+    let mut writes = Some(0u32);
+    for choices in by_prompt.values() {
+        if let Some((read, _)) = choices.first() {
+            reads = reads.saturating_add(*read);
+        }
+        let prompt_write = choices
+            .iter()
+            .map(|(_, write)| *write)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|values| values.into_iter().max());
+        writes = match (writes, prompt_write) {
+            (Some(total), Some(write)) => Some(total.saturating_add(write)),
+            _ => None,
+        };
+    }
+    (reads, writes)
 }
 
 pub(super) fn completion_logprobs(extras: Option<&ChunkExtras>, include_input: bool) -> Logprobs {
@@ -738,12 +803,22 @@ mod tests {
         completion_prompt_specs, completion_response_value, unary_completion,
     };
     use crate::api_server::guard::AbortGuard;
-    use crate::message::response::ChunkExtras;
+    use crate::message::response::{CacheUsage, ChunkExtras, ResponseItem};
     use axum::http::StatusCode;
     use dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
     };
     use futures::StreamExt;
+
+    fn with_cache(mut item: ResponseItem, usage: CacheUsage) -> ResponseItem {
+        match &mut item {
+            ResponseItem::Frame(event) | ResponseItem::Done(event) => {
+                event.cache_usage = Some(Box::new(usage));
+            }
+            _ => panic!("generation chunk expected"),
+        }
+        item
+    }
 
     #[test]
     fn dynamo_completion_request_deserializes_directly() {
@@ -822,9 +897,25 @@ mod tests {
         let (choice0, tx0) = submitted(0, 0, "r0");
         let (choice1, tx1) = submitted(1, 0, "r1");
         tx0.send(chunk("r0", "a", false)).await.unwrap();
-        tx0.send(chunk("r0", "b", true)).await.unwrap();
+        let final0 = with_cache(
+            chunk("r0", "b", true),
+            CacheUsage {
+                read_tokens: 3,
+                write_tokens: Some(2),
+                write_tokens_by_ttl: None,
+            },
+        );
+        tx0.send(final0).await.unwrap();
         tx1.send(chunk("r1", "x", false)).await.unwrap();
-        tx1.send(chunk("r1", "y", true)).await.unwrap();
+        let final1 = with_cache(
+            chunk("r1", "y", true),
+            CacheUsage {
+                read_tokens: 3,
+                write_tokens: Some(4),
+                write_tokens_by_ttl: None,
+            },
+        );
+        tx1.send(final1).await.unwrap();
 
         let response = unary_completion(
             vec![choice0, choice1],
@@ -846,13 +937,26 @@ mod tests {
         assert_eq!(value["choices"][0]["matched_stop"], "</s>");
         assert_eq!(value["usage"]["prompt_tokens"], 5);
         assert_eq!(value["usage"]["completion_tokens"], 4);
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(
+            value["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            4
+        );
     }
 
     #[tokio::test]
     async fn stream_uses_deltas_then_usage_and_done() {
         let (choice, tx) = submitted(0, 0, "r0");
         tx.send(chunk("r0", "a", false)).await.unwrap();
-        tx.send(chunk("r0", "b", true)).await.unwrap();
+        let final_chunk = with_cache(
+            chunk("r0", "b", true),
+            CacheUsage {
+                read_tokens: 2,
+                write_tokens: Some(0),
+                write_tokens_by_ttl: None,
+            },
+        );
+        tx.send(final_chunk).await.unwrap();
 
         let stream = completion_event_stream(
             vec![choice],
@@ -877,6 +981,17 @@ mod tests {
         assert!(usage["choices"].as_array().unwrap().is_empty());
         assert_eq!(usage["usage"]["prompt_tokens"], 5);
         assert_eq!(usage["usage"]["completion_tokens"], 2);
+        assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+        assert_eq!(
+            usage["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            0
+        );
         assert_eq!(frames[3], "[DONE]");
+    }
+
+    #[test]
+    fn ordinary_usage_omits_cache_details() {
+        let value = serde_json::to_value(super::completion_usage(5, 2, 0, None)).unwrap();
+        assert!(value.get("prompt_tokens_details").is_none());
     }
 }

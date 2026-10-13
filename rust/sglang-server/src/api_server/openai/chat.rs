@@ -19,9 +19,9 @@ use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
-    TopLogprobs,
+    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason as OpenAIFinishReason, ResponseFormat, Role,
+    ServiceTier as ChatServiceTier, Stop, TopLogprobs,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -437,6 +437,7 @@ pub(super) async fn unary_chat(
 ) -> Response {
     let mut choices = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = 0;
+    let mut cache_usage = Vec::with_capacity(submitted.len());
     let mut completion_tokens = 0u64;
 
     for (index, rid, rx) in submitted {
@@ -451,6 +452,7 @@ pub(super) async fn unary_chat(
             prompt_tokens = output.prompt_tokens;
         }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+        cache_usage.push((output.cache_read_tokens(), output.cache_write_tokens()));
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
         let finish_reason = chat_finish_reason(&output);
         // Split reasoning markers out of the content first (Python splits
@@ -489,7 +491,13 @@ pub(super) async fn unary_chat(
         });
     }
 
-    Json(CreateChatCompletionResponse {
+    let cache_read_tokens = cache_usage.first().map_or(0, |(read, _)| *read);
+    let cache_write_tokens = cache_usage
+        .iter()
+        .map(|(_, write)| *write)
+        .collect::<Option<Vec<_>>>()
+        .and_then(|values| values.into_iter().max());
+    let response = CreateChatCompletionResponse {
         id: response_id,
         choices,
         created,
@@ -500,9 +508,15 @@ pub(super) async fn unary_chat(
         usage: Some(completion_usage(
             prompt_tokens,
             u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+            cache_read_tokens,
+            cache_write_tokens,
         )),
-    })
-    .into_response()
+    };
+    let mut value = serde_json::to_value(&response).expect("OpenAI response must serialize");
+    if let Some(usage) = response.usage.as_ref() {
+        restore_cache_write_tokens(&mut value, usage);
+    }
+    Json(value).into_response()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -528,6 +542,7 @@ pub(super) fn chat_event_stream(
         let mut rids = Vec::with_capacity(count);
         let mut streams = Vec::with_capacity(count);
         let mut prompt_tokens = 0u32;
+        let mut cache_usage = vec![(0u32, None); count];
         let mut completion_tokens = 0u64;
         // One stateful reasoning splitter per choice (Python keeps a
         // `reasoning_parser_dict` per index).
@@ -617,6 +632,7 @@ pub(super) fn chat_event_stream(
                 prompt_tokens = output.prompt_tokens;
             }
             completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+            cache_usage[index] = (output.cache_read_tokens(), output.cache_write_tokens());
             let finish_reason = chat_finish_reason(&output);
             // Split the step's text into (reasoning, normal) deltas when
             // `--reasoning-parser` is set. Mirrors Python's per-step emission:
@@ -713,6 +729,12 @@ pub(super) fn chat_event_stream(
         }
 
         if include_usage {
+            let cache_read_tokens = cache_usage.first().map_or(0, |(read, _)| *read);
+            let cache_write_tokens = cache_usage
+                .iter()
+                .map(|(_, write)| *write)
+                .collect::<Option<Vec<_>>>()
+                .and_then(|values| values.into_iter().max());
             yield Annotated {
                 data: Some(CreateChatCompletionStreamResponse {
                     id: response_id,
@@ -725,6 +747,8 @@ pub(super) fn chat_event_stream(
                     usage: Some(completion_usage(
                         prompt_tokens,
                         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                        cache_read_tokens,
+                        cache_write_tokens,
                     )),
                 }),
                 id: None,
@@ -784,7 +808,11 @@ pub(super) fn chat_event_stream(
 }
 
 fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) -> String {
+    let usage = response.usage.clone();
     let mut response = serde_json::to_value(response).expect("OpenAI response must serialize");
+    if let Some(usage) = usage.as_ref() {
+        restore_cache_write_tokens(&mut response, usage);
+    }
     if let Some(delta) = response
         .pointer_mut("/choices/0/delta")
         .and_then(serde_json::Value::as_object_mut)
@@ -794,6 +822,25 @@ fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) 
             .or_insert(serde_json::Value::Null);
     }
     response.to_string()
+}
+
+/// Dynamo 8.1's chat response serializer predates async-openai's
+/// `cache_write_tokens` field and drops it from its null-omitting shadow. Recover
+/// only that scheduler-provided value from the upstream usage serialization.
+fn restore_cache_write_tokens(value: &mut serde_json::Value, usage: &CompletionUsage) {
+    let usage_value = serde_json::to_value(usage).expect("OpenAI usage must serialize");
+    let Some(write_tokens) = usage_value
+        .pointer("/prompt_tokens_details/cache_write_tokens")
+        .cloned()
+    else {
+        return;
+    };
+    if let Some(details) = value
+        .pointer_mut("/usage/prompt_tokens_details")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        details.insert("cache_write_tokens".into(), write_tokens);
+    }
 }
 
 #[allow(deprecated)]
@@ -857,7 +904,7 @@ mod tests {
     };
     use crate::api_server::guard::AbortGuard;
     use crate::message::config::DefaultSamplingParams;
-    use crate::message::response::ChunkExtras;
+    use crate::message::response::{CacheUsage, ChunkExtras, ResponseItem};
     use axum::http::StatusCode;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
@@ -868,6 +915,16 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    fn with_cache(mut item: ResponseItem, usage: CacheUsage) -> ResponseItem {
+        match &mut item {
+            ResponseItem::Frame(event) | ResponseItem::Done(event) => {
+                event.cache_usage = Some(Box::new(usage));
+            }
+            _ => panic!("generation chunk expected"),
+        }
+        item
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
@@ -1032,8 +1089,24 @@ mod tests {
     async fn unary_chat_fans_in_choices_and_usage() {
         let (choice0, tx0) = chat_submitted(0, "r0");
         let (choice1, tx1) = chat_submitted(1, "r1");
-        tx0.send(chunk("r0", "Paris", true)).await.unwrap();
-        tx1.send(chunk("r1", "Paris", true)).await.unwrap();
+        let output0 = with_cache(
+            chunk("r0", "Paris", true),
+            CacheUsage {
+                read_tokens: 3,
+                write_tokens: Some(4),
+                write_tokens_by_ttl: Some([(300, 4)].into_iter().collect()),
+            },
+        );
+        let output1 = with_cache(
+            chunk("r1", "Paris", true),
+            CacheUsage {
+                read_tokens: 3,
+                write_tokens: Some(6),
+                write_tokens_by_ttl: Some([(3600, 6)].into_iter().collect()),
+            },
+        );
+        tx0.send(output0).await.unwrap();
+        tx1.send(output1).await.unwrap();
 
         let response = unary_chat(
             vec![choice0, choice1],
@@ -1059,6 +1132,11 @@ mod tests {
         assert_eq!(value["choices"][1]["index"], 1);
         assert_eq!(value["usage"]["prompt_tokens"], 5);
         assert_eq!(value["usage"]["completion_tokens"], 2);
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(
+            value["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            6
+        );
     }
 
     #[tokio::test]
@@ -1097,6 +1175,7 @@ mod tests {
         );
         assert_eq!(value["choices"][0]["message"]["content"], "Paris");
         assert!(value["choices"][0]["message"]["reasoning_content"].is_string());
+        assert!(value["usage"].get("prompt_tokens_details").is_none());
     }
 
     #[tokio::test]
@@ -1154,7 +1233,15 @@ mod tests {
     async fn streaming_chat_emits_role_deltas_usage_and_done() {
         let (choice, tx) = chat_submitted(0, "r0");
         tx.send(chunk("r0", "Par", false)).await.unwrap();
-        tx.send(chunk("r0", "is", true)).await.unwrap();
+        let final_chunk = with_cache(
+            chunk("r0", "is", true),
+            CacheUsage {
+                read_tokens: 2,
+                write_tokens: Some(0),
+                write_tokens_by_ttl: Some([(300, 0)].into_iter().collect()),
+            },
+        );
+        tx.send(final_chunk).await.unwrap();
 
         let stream = chat_event_stream(
             vec![choice],
@@ -1187,6 +1274,11 @@ mod tests {
         assert!(terminal["choices"][0]["delta"]["reasoning_content"].is_null());
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert_eq!(usage["usage"]["completion_tokens"], 2);
+        assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+        assert_eq!(
+            usage["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            0
+        );
         assert_eq!(frames[4], "[DONE]");
     }
 }
