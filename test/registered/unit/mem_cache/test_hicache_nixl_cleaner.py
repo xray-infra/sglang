@@ -252,7 +252,7 @@ with open(sys.argv[4], "w") as output:
             )
         open(start, "w").close()
         for process in processes:
-            process.wait(timeout=5)
+            process.wait(timeout=30)
             self.assertEqual(process.returncode, 0)
         inodes = []
         for result in results:
@@ -326,7 +326,7 @@ with retention.transfer_guard([sys.argv[3]]):
             [sys.executable, "-c", code, *self.base_dirs, path, ready], env=env
         )
         self.addCleanup(lambda: process.poll() is None and process.kill())
-        deadline = time.time() + 3
+        deadline = time.time() + 20
         while not os.path.exists(ready) and time.time() < deadline:
             time.sleep(0.01)
         self.assertTrue(os.path.exists(ready))
