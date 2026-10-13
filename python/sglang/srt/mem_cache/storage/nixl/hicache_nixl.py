@@ -3,7 +3,7 @@ import os
 import time
 import uuid
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, List, Optional
 
 import torch
@@ -241,16 +241,34 @@ class HiCacheNixl(HiCacheStorage):
             return (0, 0, 0, self.file_manager.get_file_path(key))
         return (0, 0, 0, key)
 
-    def _query_keys_exist(self, keys: List[str]) -> List[bool]:
+    @staticmethod
+    def _file_query_matches_size(res: Any, expected_size: int) -> bool:
+        if res is None or not isinstance(res, dict):
+            return False
+        try:
+            return int(res.get("size", -1)) == expected_size
+        except (TypeError, ValueError):
+            return False
+
+    def _query_keys_exist(
+        self, keys: List[str], expected_sizes: Optional[List[int]] = None
+    ) -> List[bool]:
         if not keys:
             return []
+        if expected_sizes is not None and len(expected_sizes) != len(keys):
+            raise ValueError("NIXL query key and expected-size counts must match")
         tuples = [self._create_query_tuple(key) for key in keys]
         query_res = self.agent.query_memory(
             tuples,
             self.backend_selector.backend_name,
             mem_type=self.backend_selector.mem_type,
         )
-        return [res is not None for res in query_res]
+        if self.backend_selector.mem_type != "FILE" or expected_sizes is None:
+            return [res is not None for res in query_res]
+        return [
+            self._file_query_matches_size(res, expected_size)
+            for res, expected_size in zip(query_res, expected_sizes)
+        ]
 
     def _xfer_and_wait(
         self,
@@ -974,15 +992,31 @@ class HiCacheNixl(HiCacheStorage):
             if ctx is None:
                 final_pages = 0
                 break
-            key_multiplier = (
-                self._get_hybrid_key_multiplier(transfer.name, ctx.host_pool)
-                if ctx.is_zero_copy
-                else 1
+            bounded_keys = keys[:kv_pages]
+            page_size = getattr(ctx.host_pool, "page_size", 1) or 1
+            bounded_indices = (
+                transfer.host_indices[: len(bounded_keys) * page_size]
+                if transfer.host_indices is not None
+                else None
             )
-            component_keys = self._get_hybrid_component_keys(
-                keys[:kv_pages], transfer.name, key_multiplier
+            bounded_transfer = replace(
+                transfer,
+                keys=bounded_keys,
+                host_indices=bounded_indices,
             )
-            exists_results = self._query_keys_exist(component_keys)
+            (
+                _host_pool,
+                component_keys,
+                component_buffers,
+                _page_offsets,
+                key_multiplier,
+            ) = self._prepare_pool_transfer(bounded_transfer, for_write=False)
+            if not component_keys or len(component_keys) != len(component_buffers):
+                final_pages = 0
+                break
+            exists_results = self._query_keys_exist(
+                component_keys, [size for _, size in component_buffers]
+            )
             page_exists = self._page_results(exists_results, key_multiplier)
 
             boundary = 0

@@ -13,7 +13,10 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import (
     HiCacheL3Cleaner,
     _parse_group_key,
@@ -28,6 +31,84 @@ from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
     NixlFileManager,
 )
 from sglang.test.test_utils import CustomTestCase
+
+
+class TestNixlFileQuery(CustomTestCase):
+    def _cache_with_results(self, results):
+        cache = object.__new__(HiCacheNixl)
+        cache.backend_selector = SimpleNamespace(backend_name="POSIX", mem_type="FILE")
+        cache.file_manager = SimpleNamespace(get_file_path=lambda key: f"/cache/{key}")
+        cache.agent = SimpleNamespace(query_memory=lambda *_args, **_kwargs: results)
+        return cache
+
+    def test_file_query_rejects_incomplete_cache_objects(self):
+        cache = self._cache_with_results(
+            [
+                {"size": "0"},
+                {"size": "149760"},
+                None,
+                {"size": "224640"},
+            ]
+        )
+
+        self.assertEqual(
+            cache._query_keys_exist(
+                ["empty", "complete", "missing", "short"],
+                [149760, 149760, 224640, 149760],
+            ),
+            [False, True, False, False],
+        )
+
+    def test_file_query_without_expected_sizes_preserves_existence_semantics(self):
+        cache = self._cache_with_results([{"size": "0"}, None])
+
+        self.assertEqual(cache._query_keys_exist(["present", "missing"]), [True, False])
+
+    def test_file_query_requires_one_expected_size_per_key(self):
+        cache = self._cache_with_results([])
+
+        with self.assertRaisesRegex(ValueError, "counts must match"):
+            cache._query_keys_exist(["one", "two"], [1])
+
+    def test_hybrid_exists_requires_complete_component_sizes(self):
+        cache = object.__new__(HiCacheNixl)
+        pool_name = PoolName.DEEPSEEK_V4_C1
+        host_pool = SimpleNamespace(page_size=1)
+        cache.registered_pools = {pool_name: host_pool}
+        cache._hybrid_pool_ctx = {
+            pool_name: SimpleNamespace(host_pool=host_pool, is_zero_copy=True)
+        }
+        cache.batch_exists = lambda _keys, _extra_info=None: 2
+        cache._prepare_pool_transfer = lambda _transfer, for_write: (
+            host_pool,
+            ["page-0-c1", "page-1-c1"],
+            [(1000, 149760), (2000, 149760)],
+            [0, 1],
+            1,
+        )
+        observed = {}
+
+        def query(component_keys, expected_sizes):
+            observed["keys"] = component_keys
+            observed["sizes"] = expected_sizes
+            return [True, False]
+
+        cache._query_keys_exist = query
+        result = cache.batch_exists_v2(
+            ["page-0", "page-1"],
+            [
+                PoolTransfer(
+                    name=pool_name,
+                    host_indices=[0, 1],
+                    keys=["page-0", "page-1"],
+                )
+            ],
+        )
+
+        self.assertEqual(result.kv_hit_pages, 1)
+        self.assertEqual(result.extra_pool_hit_pages[pool_name], 1)
+        self.assertEqual(observed["keys"], ["page-0-c1", "page-1-c1"])
+        self.assertEqual(observed["sizes"], [149760, 149760])
 
 
 class TestHiCacheL3Cleaner(CustomTestCase):
