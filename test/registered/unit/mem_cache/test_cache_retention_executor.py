@@ -45,7 +45,7 @@ class TestCacheRetentionExecutor(TestCase):
         )
         cache.match_prefix = lambda params: SimpleNamespace(
             full_kv_hit_length=len(params.key),
-            best_match_node=nodes[len(params.key) // 4],
+            best_match_node=len(params.key) // 4,
         )
         req = SimpleNamespace(
             origin_input_ids=array("q", range(8)),
