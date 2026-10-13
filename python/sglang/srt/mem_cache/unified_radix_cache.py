@@ -1804,17 +1804,25 @@ class UnifiedRadixCache(BasePrefixCache):
                 f"retained prefix has only {result.full_kv_hit_length} of "
                 f"{boundary} committed cache tokens"
             )
-        # best_match_node is the deepest exact radix node accepted across
-        # device- and host-resident components; renewals may have no device node.
-        node = self.tree_core.node_by_id(result.best_match_node)
+        # Walk the physical radix path rather than best_match_node. A match at a
+        # boundary inside a node splits that node, but component validators may
+        # still select an earlier checkpoint (for example, the prior chunked-
+        # prefill commit). Retention needs every committed storage page through
+        # the exact boundary, including the newly created split node.
+        node = self.tree_core.root_node
         path: list[NodeId] = []
         represented = 0
-        while node.parent is not None:
-            path.append(node.id)
-            assert node.key is not None
-            represented += len(node.key)
-            node = node.parent
-        path.reverse()
+        while represented < boundary:
+            child_key = key.child_key_at(represented, self.page_size)
+            child = node.children.get(child_key)
+            if child is None or child.key is None:
+                break
+            child_len = len(child.key)
+            if child_len <= 0 or represented + child_len > boundary:
+                break
+            path.append(child.id)
+            represented += child_len
+            node = child
         if represented != boundary:
             raise RuntimeError(
                 f"retained radix path represents {represented}, expected {boundary} tokens"

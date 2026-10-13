@@ -29,19 +29,21 @@ class _Node:
         self.id = node_id
         self.key = key
         self.parent = parent
+        self.children = {}
 
 
 class TestCacheRetentionExecutor(TestCase):
     def _path_cache(self):
         root = _Node(0, [])
-        first = _Node(1, [1, 2, 3, 4], root)
-        second = _Node(2, [5, 6, 7, 8], first)
-        nodes = {0: root, 1: first, 2: second}
+        first = _Node(1, [0, 1, 2, 3], root)
+        second = _Node(2, [4, 5, 6, 7], first)
+        root.children[(0, 1, 2, 3)] = first
+        first.children[(4, 5, 6, 7)] = second
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.tree_core = SimpleNamespace(
             is_eagle=False,
             page_size=4,
-            node_by_id=lambda node_id: nodes[node_id],
+            root_node=root,
         )
         cache.match_prefix = lambda params: SimpleNamespace(
             full_kv_hit_length=len(params.key),
@@ -62,6 +64,61 @@ class TestCacheRetentionExecutor(TestCase):
         cache, req = self._path_cache()
         with self.assertRaisesRegex(ValueError, "not exactly representable"):
             cache._retention_path(req, 6)
+
+    def test_boundary_after_first_chunked_commit_uses_exact_physical_path(self):
+        chunk_size = 2048
+        page_size = 1024
+        boundary = 3072
+        prompt_tokens = 8001
+        root = _Node(0, [])
+        first = _Node(1, list(range(chunk_size)), root)
+        second = _Node(2, list(range(chunk_size, boundary)), first)
+        tokens = array("q", range(prompt_tokens))
+        root.children[tuple(tokens[:page_size])] = first
+        first.children[tuple(tokens[chunk_size : chunk_size + page_size])] = second
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(
+            is_eagle=False,
+            page_size=page_size,
+            root_node=root,
+        )
+        # Component consensus can remain at the prior chunk checkpoint even
+        # though FULL KV matching split a physical node at the exact boundary.
+        cache.match_prefix = lambda _params: SimpleNamespace(
+            full_kv_hit_length=boundary,
+            best_match_node=first.id,
+        )
+        req = SimpleNamespace(
+            rid="chunked",
+            origin_input_ids=tokens,
+            extra_key=None,
+            cache_salt=None,
+            cached_tokens=0,
+            cache_write_candidate_ranges=[
+                (0, chunk_size),
+                (chunk_size, 4096),
+                (4096, 6144),
+                (6144, 8000),
+            ],
+            cache_retention_output_deferred=True,
+            cache_write_tokens=None,
+            cache_write_tokens_by_ttl=None,
+        )
+
+        self.assertEqual(cache._retention_path(req, boundary), [first.id, second.id])
+        # Usage is still unpublished until the durable write acknowledgement
+        # finishes the retention transaction.
+        self.assertIsNone(req.cache_write_tokens)
+        tx = _RetentionTransaction(req, {60: boundary}, second.id, mock.Mock(), set())
+        cache._retention_transactions = {req.rid: tx}
+        cache._retention_operation_rids = {}
+        cache._retention_ready_outputs = []
+        cache.dec_lock_ref = mock.Mock()
+        cache._finish_cache_retention_transaction(tx, success=True)
+        self.assertEqual(req.cache_write_tokens, boundary)
+        self.assertEqual(req.cache_write_tokens_by_ttl, {60: boundary})
+        self.assertEqual(cache.take_cache_retention_ready_outputs(), [req])
 
     def test_multi_ttl_queues_max_covering_policy(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
