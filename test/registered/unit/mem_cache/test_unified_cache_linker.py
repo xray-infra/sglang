@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
+    _PendingLoad,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
@@ -864,6 +865,30 @@ def test_async_load_pins_node_until_completion():
     assert unlocks == [(node_id, lock_params)]
 
 
+def test_async_load_publishes_external_path_only_after_completion():
+    linker = _FakeLinker()
+    marks = []
+    cache = _cache_for_wrapper(
+        tree_core=SimpleNamespace(
+            enable_external_cache_linker=False,
+            mark_external_cache_stored_path=lambda node, until: marks.append(
+                (node, until)
+            ),
+        ),
+        inc_lock_ref=lambda node: SimpleNamespace(to_dec_params=lambda: object()),
+        dec_lock_ref=lambda node, params: None,
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+
+    wrapper._queue_load("rid", 7, [object()], until_node_id=11)
+    assert marks == []
+
+    linker.completed_loads.append(["rid"])
+    wrapper.drain_loads(finish_count=1)
+
+    assert marks == [(7, 11)]
+
+
 def test_release_request_cancels_queued_load():
     linker = _FakeLinker()
     lock_params = object()
@@ -873,7 +898,7 @@ def test_release_request_cancels_queued_load():
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
     wrapper.hit_markers["rid"] = object()
-    wrapper.pending_loads["rid"] = (7, lock_params)
+    wrapper.pending_loads["rid"] = _PendingLoad(7, lock_params, None)
     linker.queued_loads["rid"] = [object()]
 
     wrapper.release_request("rid")
@@ -990,7 +1015,7 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
         dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id))
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper.pending_loads["rid"] = (7, object())
+    wrapper.pending_loads["rid"] = _PendingLoad(7, object(), None)
 
     wrapper.close()
 
@@ -1324,7 +1349,10 @@ def test_linker_load_preserves_swa_boundaries(
     assert req.kv.swa_evicted_seqlen == expected_boundary
     assert req.kv.kv_allocated_len == (previous_boundary or 4)
     assert cache.insert.call_args.args[0].swa_evicted_seqlen == expected_boundary
-    cache.tree_core.mark_external_cache_stored_path.assert_called_once_with(0, 0)
+    wrapper._queue_load.assert_called_once_with(
+        "rid", 0, wrapper._queue_load.call_args.args[2], until_node_id=0
+    )
+    cache.tree_core.mark_external_cache_stored_path.assert_not_called()
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOAD
     ]
