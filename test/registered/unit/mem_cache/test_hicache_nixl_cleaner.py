@@ -15,7 +15,13 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+import torch
+
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import (
     HiCacheL3Cleaner,
@@ -73,19 +79,19 @@ class TestNixlFileQuery(CustomTestCase):
     def test_hybrid_exists_requires_complete_component_sizes(self):
         cache = object.__new__(HiCacheNixl)
         pool_name = PoolName.DEEPSEEK_V4_C1
-        host_pool = SimpleNamespace(page_size=1)
+        host_pool = SimpleNamespace(
+            page_size=1,
+            get_page_buffer_meta=lambda _indices: ([1000], [149760]),
+        )
         cache.registered_pools = {pool_name: host_pool}
         cache._hybrid_pool_ctx = {
             pool_name: SimpleNamespace(host_pool=host_pool, is_zero_copy=True)
         }
         cache.batch_exists = lambda _keys, _extra_info=None: 2
-        cache._prepare_pool_transfer = lambda _transfer, for_write: (
-            host_pool,
-            ["page-0-c1", "page-1-c1"],
-            [(1000, 149760), (2000, 149760)],
-            [0, 1],
-            1,
-        )
+        cache._get_hybrid_key_multiplier = lambda _name, _pool: 1
+        cache._get_hybrid_component_keys = lambda keys, _name, _multiplier: [
+            f"{key}-c1" for key in keys
+        ]
         observed = {}
 
         def query(component_keys, expected_sizes):
@@ -99,7 +105,7 @@ class TestNixlFileQuery(CustomTestCase):
             [
                 PoolTransfer(
                     name=pool_name,
-                    host_indices=[0, 1],
+                    host_indices=torch.tensor([0, 1]),
                     keys=["page-0", "page-1"],
                 )
             ],
@@ -109,6 +115,53 @@ class TestNixlFileQuery(CustomTestCase):
         self.assertEqual(result.extra_pool_hit_pages[pool_name], 1)
         self.assertEqual(observed["keys"], ["page-0-c1", "page-1-c1"])
         self.assertEqual(observed["sizes"], [149760, 149760])
+
+    def test_trailing_pool_size_probe_uses_only_available_tail_indices(self):
+        cache = object.__new__(HiCacheNixl)
+        pool_name = PoolName.SWA
+        observed = {}
+
+        def get_page_buffer_meta(indices):
+            observed["sample_indices"] = indices.numel()
+            return [1000], [6439680]
+
+        host_pool = SimpleNamespace(
+            page_size=256,
+            get_page_buffer_meta=get_page_buffer_meta,
+        )
+        cache.registered_pools = {pool_name: host_pool}
+        cache._hybrid_pool_ctx = {
+            pool_name: SimpleNamespace(host_pool=host_pool, is_zero_copy=True)
+        }
+        cache.batch_exists = lambda _keys, _extra_info=None: 34
+        cache._get_hybrid_key_multiplier = lambda _name, _pool: 1
+        cache._get_hybrid_component_keys = lambda keys, _name, _multiplier: [
+            f"{key}-swa" for key in keys
+        ]
+
+        def query(component_keys, expected_sizes):
+            observed["keys"] = component_keys
+            observed["sizes"] = expected_sizes
+            return [False] * 6 + [True, True] + [False] * 26
+
+        cache._query_keys_exist = query
+        result = cache.batch_exists_v2(
+            [f"page-{i}" for i in range(34)],
+            [
+                PoolTransfer(
+                    name=pool_name,
+                    host_indices=torch.arange(256),
+                    keys=["__placeholder__"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ],
+        )
+
+        self.assertEqual(result.kv_hit_pages, 8)
+        self.assertEqual(result.extra_pool_hit_pages[pool_name], 8)
+        self.assertEqual(observed["sample_indices"], 256)
+        self.assertEqual(len(observed["keys"]), 34)
+        self.assertEqual(observed["sizes"], [6439680] * 34)
 
 
 class TestHiCacheL3Cleaner(CustomTestCase):

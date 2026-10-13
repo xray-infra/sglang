@@ -3,7 +3,7 @@ import os
 import time
 import uuid
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import torch
@@ -993,30 +993,41 @@ class HiCacheNixl(HiCacheStorage):
                 final_pages = 0
                 break
             bounded_keys = keys[:kv_pages]
-            page_size = getattr(ctx.host_pool, "page_size", 1) or 1
-            bounded_indices = (
-                transfer.host_indices[: len(bounded_keys) * page_size]
-                if transfer.host_indices is not None
-                else None
+            key_multiplier = (
+                self._get_hybrid_key_multiplier(transfer.name, ctx.host_pool)
+                if ctx.is_zero_copy
+                else 1
             )
-            bounded_transfer = replace(
-                transfer,
-                keys=bounded_keys,
-                host_indices=bounded_indices,
+            component_keys = self._get_hybrid_component_keys(
+                bounded_keys, transfer.name, key_multiplier
             )
-            (
-                _host_pool,
-                component_keys,
-                component_buffers,
-                _page_offsets,
-                key_multiplier,
-            ) = self._prepare_pool_transfer(bounded_transfer, for_write=False)
-            if not component_keys or len(component_keys) != len(component_buffers):
+
+            if ctx.is_zero_copy:
+                page_size = getattr(ctx.host_pool, "page_size", 1) or 1
+                if (
+                    transfer.host_indices is None
+                    or transfer.host_indices.numel() < page_size
+                ):
+                    final_pages = 0
+                    break
+                _, sample_sizes = ctx.host_pool.get_page_buffer_meta(
+                    transfer.host_indices[:page_size]
+                )
+                if len(sample_sizes) != key_multiplier:
+                    final_pages = 0
+                    break
+                expected_sizes = list(sample_sizes) * len(bounded_keys)
+            else:
+                bounce_page_bytes = getattr(ctx, "bounce_page_bytes", 0)
+                if bounce_page_bytes <= 0:
+                    final_pages = 0
+                    break
+                expected_sizes = [bounce_page_bytes] * len(component_keys)
+
+            if not component_keys or len(component_keys) != len(expected_sizes):
                 final_pages = 0
                 break
-            exists_results = self._query_keys_exist(
-                component_keys, [size for _, size in component_buffers]
-            )
+            exists_results = self._query_keys_exist(component_keys, expected_sizes)
             page_exists = self._page_results(exists_results, key_multiplier)
 
             boundary = 0
