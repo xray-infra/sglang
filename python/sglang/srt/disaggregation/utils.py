@@ -1187,10 +1187,24 @@ def append_state_component(
 
 def get_dsa_state_page_indices(pool, kv_indices: torch.Tensor) -> np.ndarray:
     """Return the physical indexer rows that back DSA state."""
-    index_page_size = getattr(pool, "index_page_size", None)
-    if index_page_size is None and hasattr(pool, "full_kv_pool"):
-        pool = pool.full_kv_pool
+    transfer_page_size = getattr(pool, "page_size", None)
+    visited_pool_ids = set()
+    index_page_size = None
+    while id(pool) not in visited_pool_ids:
+        visited_pool_ids.add(id(pool))
         index_page_size = getattr(pool, "index_page_size", None)
+        if index_page_size is not None:
+            break
+        nested_pool = getattr(pool, "full_kv_pool", None)
+        if nested_pool is None:
+            break
+        pool = nested_pool
+
+    if index_page_size is None:
+        # DCP-aware wrappers expose their already-physical transfer page size
+        # while keeping the concrete DSA pool behind backend-specific layers.
+        index_page_size = transfer_page_size
+
     if not isinstance(index_page_size, int) or index_page_size <= 0:
         raise ValueError(
             "DSA state transfer requires a positive index_page_size, got "
