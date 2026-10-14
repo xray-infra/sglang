@@ -33,6 +33,7 @@ class TestDSAStatePageIndices(unittest.TestCase):
         pools = (
             dsa_pool,
             SimpleNamespace(use_dsa=True, full_kv_pool=dsa_pool),
+            SimpleNamespace(use_dsa=False, full_kv_pool=dsa_pool),
         )
         kv_indices = torch.arange(142520, dtype=torch.int64)
 
