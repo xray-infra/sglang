@@ -1185,6 +1185,23 @@ def append_state_component(
     kv_args.state_layer_ids.append(layer_ids or [])
 
 
+def get_dsa_state_page_indices(pool, kv_indices: torch.Tensor) -> np.ndarray:
+    """Return the physical indexer rows that back DSA state."""
+    if getattr(pool, "use_dsa", False) and hasattr(pool, "full_kv_pool"):
+        pool = pool.full_kv_pool
+
+    index_page_size = getattr(pool, "index_page_size", None)
+    if not isinstance(index_page_size, int) or index_page_size <= 0:
+        raise ValueError(
+            "DSA state transfer requires a positive index_page_size, got "
+            f"{index_page_size!r}"
+        )
+
+    from sglang.srt.mem_cache.common import kv_to_page_indices
+
+    return kv_to_page_indices(kv_indices, index_page_size)
+
+
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
     if getattr(pool, "use_dsa", False):
         pool = pool.full_kv_pool
