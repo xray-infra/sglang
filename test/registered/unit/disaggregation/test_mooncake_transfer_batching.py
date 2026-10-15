@@ -8,15 +8,52 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    get_dsa_state_page_indices,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+class TestDSAStatePageIndices(unittest.TestCase):
+    def test_uses_indexer_physical_page_size_under_dcp(self):
+        dsa_pool = SimpleNamespace(
+            use_dsa=True,
+            page_size=256,
+            index_page_size=64,
+        )
+        pools = (
+            dsa_pool,
+            SimpleNamespace(use_dsa=True, full_kv_pool=dsa_pool),
+            SimpleNamespace(use_dsa=False, full_kv_pool=dsa_pool),
+            SimpleNamespace(page_size=64, full_kv_pool=SimpleNamespace()),
+            SimpleNamespace(
+                use_dsa=False,
+                full_kv_pool=SimpleNamespace(
+                    use_dsa=False,
+                    full_kv_pool=dsa_pool,
+                ),
+            ),
+        )
+        kv_indices = torch.arange(142520, dtype=torch.int64)
+
+        for pool in pools:
+            with self.subTest(wrapped=hasattr(pool, "full_kv_pool")):
+                state_indices = get_dsa_state_page_indices(pool, kv_indices)
+
+                self.assertEqual(len(state_indices), 2227)
+                np.testing.assert_array_equal(
+                    state_indices,
+                    np.arange(2227, dtype=np.int64),
+                )
 
 
 class TestMooncakeTransferBatching(unittest.TestCase):
@@ -191,6 +228,47 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                     else:
                         self.assertEqual(manager.maybe_send_extra(**kwargs), 0)
                         np.testing.assert_array_equal(dst, [1, -1, -1])
+
+    def test_dsa_rejects_dcp_page_count_mismatch_instead_of_truncating(self):
+        src = np.arange(2227, dtype=np.int32)
+        dst = np.full(2227, -1, dtype=np.int32)
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            state_types=[StateType.DSA],
+            state_data_ptrs=[[src.ctypes.data]],
+            state_item_lens=[[src.itemsize]],
+            state_dim_per_tensor=[[]],
+            state_layer_ids=[[]],
+        )
+        manager.engine = MagicMock()
+        manager.pp_size = manager.attn_tp_size = 1
+        manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+        manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
+        peer = SimpleNamespace(
+            dst_state_data_ptrs=[[dst.ctypes.data]],
+            dst_state_item_lens=[[dst.itemsize]],
+            dst_state_dim_per_tensor=[[]],
+            dst_state_layer_ids=[[]],
+            dst_attn_tp_size=1,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "prefill=557, dst=2227",
+        ):
+            manager.maybe_send_extra(
+                req=SimpleNamespace(
+                    mooncake_session_id="cpu",
+                    dst_state_indices=[list(range(2227))],
+                ),
+                prefill_state_indices=[list(range(557))],
+                executor=None,
+                target_rank_registration_info=peer,
+            )
+
+        manager.engine.batch_transfer_sync.assert_not_called()
+        np.testing.assert_array_equal(dst, np.full(2227, -1, dtype=np.int32))
 
 
 class TestDcpDraftHeadTransfer(unittest.TestCase):
