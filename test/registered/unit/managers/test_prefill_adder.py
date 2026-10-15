@@ -259,26 +259,25 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.init_load_back.assert_not_called()
 
     def test_rejects_second_unfinished_chunk_in_same_admission(self):
-        """The scheduler publishes a newly chunked request only after the whole
-        admission pass, so `has_chunked_req` still reads False for a second
-        candidate in the same pass. The in-pass marker must reject it too."""
-        adder = self.create_shortest_prefill_adder(chunk_tokens=512)
-        first = self.create_shared_req("first-chunk")
-        first.full_untruncated_fill_ids = list(range(1024))
-        second = self.create_shared_req("second-chunk")
-        second.full_untruncated_fill_ids = list(range(1024))
+        """A chunked candidate admitted earlier in the same pass is published only
+        after the whole pass, so `has_chunked_req` still reads False here. Without
+        the in-pass marker check the second candidate is admitted as chunked
+        (extend_end set, appended to can_run_list) and becomes the tracked chunk,
+        silently forgetting the earlier request's chunk."""
+        adder = self.create_shortest_prefill_adder(chunk_tokens=4096)
+        earlier = self.create_shared_req("earlier-chunk")
+        adder.new_chunked_req = earlier
 
-        self.assertEqual(
-            adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None),
-            AddReqResult.CONTINUE,
-        )
-        self.assertIs(adder.new_chunked_req, first)
+        second = self.create_shared_req("second-chunk")
+        second.full_untruncated_fill_ids = list(range(16384))
+
         self.assertEqual(
             adder.add_one_req(second, has_chunked_req=False, truncation_align_size=None),
             AddReqResult.OTHER,
         )
-        self.assertEqual(adder.can_run_list, [first])
+        self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(second.extend_end)
+        self.assertIs(adder.new_chunked_req, earlier)
 
     def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
