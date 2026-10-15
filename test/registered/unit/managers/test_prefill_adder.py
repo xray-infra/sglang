@@ -255,6 +255,33 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(req.extend_end)
         self.mock_tree_cache.init_load_back.assert_not_called()
 
+    def test_rejects_second_unfinished_chunk_in_same_admission(self):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=256, rem_chunk_tokens=512
+        )
+        first = self.create_mock_req("first", priority=0, max_new_tokens=4)
+        first.last_node = MagicMock()
+        first.full_untruncated_fill_ids = list(range(1024))
+        second = self.create_mock_req("second", priority=0, max_new_tokens=4)
+        second.last_node = MagicMock()
+        second.full_untruncated_fill_ids = list(range(1024))
+
+        self.assertEqual(
+            adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        self.assertIs(adder.new_chunked_req, first)
+        self.assertEqual(
+            adder.add_one_req(
+                second, has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [first])
+        self.assertIsNone(second.extend_end)
+
     def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
         req = self.create_shared_req("host-miss")

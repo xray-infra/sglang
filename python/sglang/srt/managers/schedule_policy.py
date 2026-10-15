@@ -1511,11 +1511,10 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
-            ):
-                # Only one unfinished chunked request can be tracked.
+            # Only one unfinished chunked request can be tracked. The scheduler
+            # publishes the new request after this admission pass, so the
+            # in-pass marker is needed to reject a second chunked candidate too.
+            if has_chunked_req or self.new_chunked_req is not None:
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly
