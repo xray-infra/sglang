@@ -1555,12 +1555,19 @@ class SchedulerDisaggregationPrefillMixin:
                 # (decode_prefix_len, page-aligned), and its rows for a prefix
                 # still being restored point at no page yet: send only the
                 # suffix, positionally matching decode's _dsa_pages_payload.
+                #
+                # Page the rows with the *device* pool's page size, exactly as
+                # decode does. Under DCP the allocator widens its page size to
+                # page_size * dcp_size while the pool keeps page_size, so taking
+                # the allocator's value here strides four times coarser and the
+                # two lists pair up at different token ranges (observed as
+                # "DSA state index length mismatch: prefill=4, dst=16").
                 return suffix_page_indices(
                     self.req_to_token_pool.req_to_token,
                     req.kv.req_pool_idx,
                     req.disagg_decode_prefix_len,
                     seq_len,
-                    page_size,
+                    self.token_to_kv_pool_allocator.get_kvcache().page_size,
                 )
 
             def _dsa_tail_payload():
