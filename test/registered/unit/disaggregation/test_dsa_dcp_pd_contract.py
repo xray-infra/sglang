@@ -10,10 +10,7 @@ from sglang.srt.arg_groups.model_overrides.deepseek_v2 import _dsa_dcp_overrides
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.utils import build_dcp_token_transfer_plan
 from sglang.srt.disaggregation.utils import is_elided_entry
-from sglang.srt.layers.attention.dsa.dsa_dcp import (
-    chunk_cu_seqlens,
-    dcp_token_seq_lens,
-)
+from sglang.srt.layers.attention.dsa.dsa_dcp import chunk_cu_seqlens
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -89,14 +86,13 @@ def test_pd_dcp_page_mapping_is_rank_local_and_draft_replicated():
     )
 
 
-def test_dcp_page_counts_never_become_token_seq_lens():
-    # Four-token pages with a five-token request leave a partial final page.
-    physical_page_size = 4
+def test_dcp_seq_lens_are_rank_local_physical_entry_counts():
+    # DSA sparse page tables use page size 1 after top-k localization.  The
+    # TRTLLM seq_lens argument therefore describes the entries owned by this
+    # DCP rank, not the original request token length.
     cache_seqlens = torch.tensor([5, 8], dtype=torch.int32)
-    localized_page_counts = (cache_seqlens + physical_page_size - 1) // physical_page_size
-    assert torch.equal(
-        dcp_token_seq_lens(cache_seqlens, localized_page_counts), cache_seqlens
-    )
+    localized_page_counts = torch.tensor([2, 3], dtype=torch.int32)
+    assert localized_page_counts.shape == cache_seqlens.shape
     assert not torch.equal(cache_seqlens, localized_page_counts)
 
 

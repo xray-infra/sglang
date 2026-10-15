@@ -62,24 +62,6 @@ def localize_dcp_page_table(
     return cache.page_table, cache.counts
 
 
-def dcp_token_seq_lens(
-    cache_seqlens: torch.Tensor, localized_page_counts: torch.Tensor
-) -> torch.Tensor:
-    """Keep TRTLLM lengths in tokens after localizing a page table.
-
-    ``localized_page_counts`` is metadata for sparse-page padding only.  It is
-    not a sequence length: with multi-token pages, and especially on a partial
-    final page, converting it to tokens loses the request's true length.
-    """
-    if cache_seqlens.ndim != 1 or localized_page_counts.ndim != 1:
-        raise ValueError("DCP sequence lengths and page counts must be vectors")
-    if cache_seqlens.shape != localized_page_counts.shape:
-        raise ValueError(
-            "DCP sequence lengths and localized page counts must have matching rows"
-        )
-    return cache_seqlens
-
-
 def chunk_cu_seqlens(cu_seqlens_q: torch.Tensor, start: int, end: int) -> torch.Tensor:
     """Return chunk-local cu-seqlens with the chunk's actual base offset."""
     if not (0 <= start < end <= cu_seqlens_q.numel() - 1):

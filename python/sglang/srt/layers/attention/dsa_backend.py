@@ -60,7 +60,6 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     DcpPageTableCache,
-    dcp_token_seq_lens,
     dcp_trtllm_sparse_attention,
     localize_dcp_page_table,
 )
@@ -3713,9 +3712,10 @@ class DeepseekSparseAttnBackend(
             page_table_1
         )
         if self.dcp_size > 1:
-            # DCP localization returns a page table and the number of owned
-            # pages.  TRTLLM seq_lens are token lengths, not page counts;
-            # preserve the metadata lengths for the physical page table.
+            # DCP localization returns a page table and the rank-local number
+            # of valid sparse physical entries.  FlashInfer's TRTLLM-GEN
+            # `seq_lens` is the physical KV length owned by each rank; with
+            # this DSA page table (page size 1), that is the owned-entry count.
             page_table_1, page_counts = localize_dcp_page_table(
                 self._dcp_page_table_cache,
                 metadata=metadata,
@@ -3725,9 +3725,7 @@ class DeepseekSparseAttnBackend(
                 dcp_size=self.dcp_size,
                 dcp_rank=self.dcp_rank,
             )
-            seq_lens = dcp_token_seq_lens(
-                metadata.cache_seqlens_int32, page_counts
-            )
+            seq_lens = page_counts
         sparse_mla_top_k_lens = None
         if self.qk_rope_head_dim == 0:
             sparse_mla_top_k_lens = prepare_trtllm_nope_sparse_metadata(page_table_1)
