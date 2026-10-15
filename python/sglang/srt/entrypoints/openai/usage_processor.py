@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
 from typing import Any, Dict, List, Mapping, Optional, final
 
 from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInfo
@@ -9,25 +8,6 @@ from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInf
 @final
 class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
-
-    @staticmethod
-    def _details_if_cached(count: int | None) -> Optional[PromptTokensDetails]:
-        """Report measured nonnegative counts, including zero; unknown is absent."""
-        if count is None or count < 0:
-            return None
-        return PromptTokensDetails(cached_tokens=count)
-
-    @staticmethod
-    def _details_from_cached_counts(
-        counts: Iterable[int | None],
-    ) -> PromptTokensDetails | None:
-        """Only report a total if every contributing prompt count is known."""
-        total: int | None = None
-        for count in counts:
-            if count is None or count < 0:
-                return None
-            total = count if total is None else total + count
-        return UsageProcessor._details_if_cached(total)
 
     @staticmethod
     def calculate_response_usage(
@@ -53,10 +33,11 @@ class UsageProcessor:
 
         cached_details = None
         if enable_cache_report:
-            cached_details = UsageProcessor._details_from_cached_counts(
-                responses[i]["meta_info"].get("cached_tokens")
+            cached_total = sum(
+                responses[i]["meta_info"].get("cached_tokens", 0)
                 for i in range(0, len(responses), n_choices)
             )
+            cached_details = PromptTokensDetails(cached_tokens=cached_total)
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -73,7 +54,7 @@ class UsageProcessor:
         prompt_tokens: Mapping[int, int],
         reasoning_tokens: Mapping[int, int],
         completion_tokens: Mapping[int, int],
-        cached_tokens: Mapping[int, int | None],
+        cached_tokens: Mapping[int, int],
         n_choices: int,
         enable_cache_report: bool = False,
         image_tokens: int = 0,
@@ -88,8 +69,10 @@ class UsageProcessor:
         total_completion_tokens = sum(completion_tokens.values())
 
         cached_details = (
-            UsageProcessor._details_from_cached_counts(
-                cached_tokens.get(idx) for idx in prompt_tokens if idx % n_choices == 0
+            PromptTokensDetails(
+                cached_tokens=sum(
+                    tok for idx, tok in cached_tokens.items() if idx % n_choices == 0
+                )
             )
             if enable_cache_report
             else None
