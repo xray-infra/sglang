@@ -3920,5 +3920,103 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
+class TestDsaDcpGuard(CustomTestCase):
+    """Boundaries of the DSA + DCP guard.
+
+    The guard must reject only what is actually unimplemented: HiSparse, and a
+    HiCache L3 storage backend whose keys carry no DCP rank. PD disaggregation
+    and the DCP-aware L2 host pool are supported combinations.
+    """
+
+    @staticmethod
+    def _cfg(**kw):
+        defaults = dict(
+            dcp_size=1,
+            enable_hisparse=False,
+            enable_hierarchical_cache=False,
+            hicache_storage_backend=None,
+            disaggregation_mode="null",
+            speculative_eagle_topk=1,
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            dcp_replicate_q_proj=None,
+            dcp_comm_backend=None,
+        )
+        defaults.update(kw)
+        return SimpleNamespace(**defaults)
+
+    def _overrides(self, **kw):
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _dsa_dcp_overrides,
+        )
+
+        return _dsa_dcp_overrides(self._cfg(**kw))
+
+    def test_dcp_disabled_declares_nothing(self):
+        self.assertEqual(self._overrides(), {})
+        self.assertEqual(self._overrides(hicache_storage_backend="mooncake"), {})
+
+    def test_l2_hicache_under_dcp_is_allowed(self):
+        # The L2 host pool translates indices per DCP rank, so only the L3
+        # backend is unsupported.
+        self.assertEqual(
+            self._overrides(dcp_size=4, enable_hierarchical_cache=True),
+            {"dsa_prefill_backend": "trtllm", "dsa_decode_backend": "trtllm"},
+        )
+
+    def test_l3_storage_under_dcp_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "L3 storage backend"):
+            self._overrides(dcp_size=4, hicache_storage_backend="mooncake")
+
+    def test_hisparse_under_dcp_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "HiSparse"):
+            self._overrides(dcp_size=4, enable_hisparse=True)
+
+    def test_pd_disaggregation_under_dcp_is_allowed(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    self._overrides(dcp_size=4, disaggregation_mode=mode),
+                    {
+                        "dsa_prefill_backend": "trtllm",
+                        "dsa_decode_backend": "trtllm",
+                    },
+                )
+
+    def test_eagle_topk_under_dcp_must_be_one(self):
+        with self.assertRaisesRegex(ValueError, "eagle-topk 1"):
+            self._overrides(dcp_size=4, speculative_eagle_topk=2)
+
+    def test_explicit_backends_are_not_overwritten(self):
+        self.assertEqual(
+            self._overrides(
+                dcp_size=4,
+                dsa_prefill_backend="flashinfer_sparse_mla",
+                dsa_decode_backend="flashinfer_sparse_mla",
+            ),
+            {},
+        )
+
+    def test_a2a_backend_defaults_replicate_q_proj(self):
+        # Pin the explicit backends so the assertion isolates the replicate flag.
+        explicit = {"dsa_prefill_backend": "x", "dsa_decode_backend": "x"}
+        for backend in ("a2a", "fi_a2a"):
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    self._overrides(dcp_size=4, dcp_comm_backend=backend, **explicit),
+                    {"dcp_replicate_q_proj": True},
+                )
+        # An explicit False must survive.
+        self.assertEqual(
+            self._overrides(
+                dcp_size=4,
+                dcp_comm_backend="a2a",
+                dcp_replicate_q_proj=False,
+                **explicit,
+            ),
+            {},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
