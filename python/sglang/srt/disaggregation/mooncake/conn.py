@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    is_elided_entry,
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
@@ -362,18 +363,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         regions: List[Tuple[int, int]] = []
         seen: Set[Tuple[int, int]] = set()
 
-        def add(ptrs: List[int], lens: List[int]) -> None:
+        def add(
+            ptrs: List[int], lens: List[int], *, skip_zero: bool = False
+        ) -> None:
             for ptr, length in zip(ptrs or [], lens or []):
+                if skip_zero and length == 0:
+                    # Only DSA index-K uses zero-length destination elision.
+                    continue
                 if (ptr, length) not in seen:
                     seen.add((ptr, length))
                     regions.append((ptr, length))
 
         add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
         add(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens)
-        for ptrs, lens in zip(
-            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+        for state_type, ptrs, lens in zip(
+            self.kv_args.state_types,
+            self.kv_args.state_data_ptrs,
+            self.kv_args.state_data_lens,
         ):
-            add(ptrs, lens)
+            add(ptrs, lens, skip_zero=state_type == StateType.DSA)
         return regions
 
     def register_buffer_to_engine(self):
@@ -832,6 +840,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         f"{state_type} decode published {len(dst_item_lens)} item "
                         f"lengths but paired entry dst[{j}] needs one"
                     )
+                if is_elided_entry(
+                    item_lens[i],
+                    dst_item_lens,
+                    j,
+                    state_type=state_type,
+                ):
+                    # One peer elided this shared-topk layer's index-K (e.g. a
+                    # dense HiSparse decode); no bytes move, so no stride to match.
+                    continue
                 if item_lens[i] != dst_item_lens[j]:
                     return (
                         f"{state_type} item length mismatch for paired "
@@ -853,6 +870,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"lengths for this stage's {layers_current_pp_stage} entries"
             )
         for layer_id in range(layers_current_pp_stage):
+            if is_elided_entry(
+                item_lens[layer_id],
+                mapped_dst_lens,
+                layer_id,
+                state_type=state_type,
+            ):
+                continue  # Elided by one peer; see the paired loop above.
             if item_lens[layer_id] != mapped_dst_lens[layer_id]:
                 return (
                     f"{state_type} item length mismatch for positional "
@@ -1037,8 +1061,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     len(dst_data_ptrs),
                     allow_positional_fallback=self.pp_size == 1,
                 )
+                # An entry elided on either side moves no bytes and has no
+                # registered buffer to write into.
                 layers_params = [
-                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
+                    for i, j in pairs
+                    if not is_elided_entry(
+                        item_lens[i],
+                        dst_item_lens,
+                        j,
+                        state_type=state_type,
+                    )
                 ]
             else:
                 src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
@@ -1046,6 +1079,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_data_ptrs, dst_data_ptrs, state_type
                     )
                 )
+                mapped_dst_lens = None
+                if dst_item_lens is not None:
+                    _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                        item_lens, dst_item_lens, state_type
+                    )
                 layers_params = [
                     (
                         src_kv_ptrs[layer_id],
@@ -1053,6 +1091,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         item_lens[layer_id],
                     )
                     for layer_id in range(layers_current_pp_stage)
+                    if not is_elided_entry(
+                        item_lens[layer_id],
+                        mapped_dst_lens,
+                        layer_id,
+                        state_type=state_type,
+                    )
                 ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
@@ -2024,8 +2068,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if len(src_indices) != len(dst_indices_local):
                     # These components are position- or request-indexed:
                     # truncating silently misaligns rows and corrupts KV.
-                    # Paged SWA/DSA tolerate at most a 1-page drift. A larger
-                    # mismatch is a layout error; truncating it corrupts state.
+                    # Paged state indices may differ by one final page, but
+                    # larger drift can pair unrelated physical pages.
                     index_count_drift = abs(len(src_indices) - len(dst_indices_local))
                     if (
                         self._requires_exact_state_index_match(st)
@@ -2094,10 +2138,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             f"{st.value} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
                         )
-                elif len(src_indices) > len(dst_indices_local):
-                    src_indices = src_indices[: len(dst_indices_local)]
-                elif len(src_indices) < len(dst_indices_local):
-                    dst_indices_local = dst_indices_local[: len(src_indices)]
+                elif len(src_indices) != len(dst_indices_local):
+                    if abs(len(src_indices) - len(dst_indices_local)) > 1:
+                        raise RuntimeError(
+                            f"{st.value} state index length drift is too large: "
+                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                        )
+                    if len(src_indices) > len(dst_indices_local):
+                        src_indices = src_indices[: len(dst_indices_local)]
+                    else:
+                        dst_indices_local = dst_indices_local[: len(src_indices)]
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,

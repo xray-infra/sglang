@@ -10,6 +10,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Tuple,
     Type,
     overload,
@@ -984,6 +985,29 @@ def compute_mamba_state_slice_byte_blocks(
     return blocks
 
 
+def is_elided_entry(
+    src_len: int,
+    dst_lens: Optional[Sequence[int]],
+    dst_index: int,
+    *,
+    state_type: Optional[object],
+) -> bool:
+    """Return whether a DSA index-K entry was elided by either peer.
+
+    A zero source is always absent.  A zero destination is skippable only for
+    the explicitly supplied DSA state; other state types may legitimately use
+    zero-length entries and must remain paired.
+    """
+    if src_len == 0:
+        return True
+    return (
+        state_type == "dsa"
+        and dst_lens is not None
+        and 0 <= dst_index < len(dst_lens)
+        and dst_lens[dst_index] == 0
+    )
+
+
 def build_transfer_entry_pairs(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],
@@ -1186,7 +1210,12 @@ def append_state_component(
 
 
 def get_dsa_state_page_indices(pool, kv_indices: torch.Tensor) -> np.ndarray:
-    """Return the physical indexer rows that back DSA state."""
+    """Return the physical indexer rows that back DSA state.
+
+    PD keeps the DSA indexer pool on its physical page size. This is distinct
+    from the logical KV page size used by the target MLA pool, and must remain
+    explicit so DCP relayout can map target and draft entries independently.
+    """
     transfer_page_size = getattr(pool, "page_size", None)
     visited_pool_ids = set()
     index_page_size = None
@@ -1201,10 +1230,7 @@ def get_dsa_state_page_indices(pool, kv_indices: torch.Tensor) -> np.ndarray:
         pool = nested_pool
 
     if index_page_size is None:
-        # DCP-aware wrappers expose their already-physical transfer page size
-        # while keeping the concrete DSA pool behind backend-specific layers.
         index_page_size = transfer_page_size
-
     if not isinstance(index_page_size, int) or index_page_size <= 0:
         raise ValueError(
             "DSA state transfer requires a positive index_page_size, got "
