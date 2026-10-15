@@ -35,9 +35,9 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
             "DCP-aware L2 host pool."
         )
     if cfg.disaggregation_mode != "null":
-        # PD peers hold rank-local DSA state and exchange it with rank-local page
-        # indices (see disaggregation.utils.get_dsa_state_page_indices), so the
-        # combination is supported rather than rejected.
+        # PD peers exchange DSA state as page-aligned suffix page indices
+        # (mem_cache.common.suffix_page_indices, used by both prefill and
+        # decode), so the combination is supported rather than rejected.
         logger.info(
             "DSA DCP with PD disaggregation enabled: dcp_size=%s mode=%s.",
             cfg.dcp_size,
