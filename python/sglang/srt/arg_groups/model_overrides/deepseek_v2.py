@@ -18,10 +18,31 @@ logger = logging.getLogger(__name__)
 def _dsa_dcp_overrides(cfg: Any) -> dict:
     if cfg.dcp_size <= 1:
         return {}
-    if cfg.enable_hisparse or cfg.enable_hierarchical_cache:
-        raise ValueError("DSA DCP does not support HiSparse or HiCache.")
+    if cfg.enable_hisparse:
+        raise ValueError("DSA DCP does not support HiSparse.")
+    # The L2 host pool is DCP-aware and handles this combination, but the L3
+    # storage layer is not: storage keys are derived from prefix hashes alone
+    # (hicache_storage.py builds them from operation.hash_value), so every DCP
+    # rank would write its rank-local shard under the same key and clobber the
+    # others' shards, and reads would restore an arbitrary rank's rows. Reject
+    # only the L3 backend; L2-only HiCache under DCP stays available.
+    if cfg.hicache_storage_backend is not None:
+        raise ValueError(
+            "DSA DCP does not support a HiCache L3 storage backend "
+            f"(--hicache-storage-backend {cfg.hicache_storage_backend}): L3 keys "
+            "carry no DCP rank, so rank-local shards overwrite each other. "
+            "Run with --dcp-size 1, or drop the storage backend and use the "
+            "DCP-aware L2 host pool."
+        )
     if cfg.disaggregation_mode != "null":
-        raise ValueError("DSA DCP does not support PD disaggregation.")
+        # PD peers hold rank-local DSA state and exchange it with rank-local page
+        # indices (see disaggregation.utils.get_dsa_state_page_indices), so the
+        # combination is supported rather than rejected.
+        logger.info(
+            "DSA DCP with PD disaggregation enabled: dcp_size=%s mode=%s.",
+            cfg.dcp_size,
+            cfg.disaggregation_mode,
+        )
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
     overrides = {
