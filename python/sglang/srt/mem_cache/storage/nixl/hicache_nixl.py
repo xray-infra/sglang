@@ -274,6 +274,23 @@ class HiCacheNixl(HiCacheStorage):
         finally:
             self.agent.release_xfer_handle(xfer_req)
 
+    def _maybe_buffered_posix_io(self, page_bytes: int) -> None:
+        # DS fused FP8 pages may have a non-sector-aligned byte
+        # length. Keep their exact representation and aligned
+        # bounce buffers, but do not request O_DIRECT on POSIX.
+        if (
+            self.file_manager is not None
+            and self.file_manager.use_direct_io
+            and self.backend_selector.backend_name == "POSIX"
+            and page_bytes % 4096 != 0
+        ):
+            self.file_manager.use_direct_io = False
+            logger.warning(
+                "HiCacheNixl: POSIX FILE uses buffered I/O for "
+                "unaligned %d-byte hybrid pages; L3 remains enabled.",
+                page_bytes,
+            )
+
     def _xfer_pre_registered(
         self,
         host_buffers: List[tuple],
@@ -434,6 +451,7 @@ class HiCacheNixl(HiCacheStorage):
             # Serialized index and Mamba pages can differ from the pool dtype.
             page_dtype = sample.dtype
             page_bytes = page_numel * sample.element_size()
+            self._maybe_buffered_posix_io(page_bytes)
             del sample
 
             pin_memory = bool(getattr(host_pool, "pin_memory", False))
