@@ -410,6 +410,24 @@ def _resolve_dsa_triton_union(*, union: int, deterministic: bool) -> int:
     return union
 
 
+def _sm120_row_seq_lens(
+    seq_lens: torch.Tensor, page_table_1: torch.Tensor, num_rows: int
+) -> torch.Tensor:
+    """Return one sparse-index bound per query row for the SM120 kernel.
+
+    FlashInfer's SM120 sparse MLA v32/GLM entry point derives its batch from the
+    query rows and requires ``seq_lens`` to hold exactly one entry per row. SGLang
+    metadata carries it per request instead: ``pad_dsa_cache_seqlens`` pads it to
+    the captured batch size on extend, and a target-verify batch keeps one entry
+    per request while the query has one row per draft token. Both cases mismatch,
+    so fall back to the page table -- it is already per row, and its count of
+    non-padding slots is exactly how many entries a row may scan.
+    """
+    if seq_lens.numel() == num_rows:
+        return seq_lens
+    return (page_table_1 >= 0).sum(dim=-1, dtype=torch.int32).clamp_min(1)
+
+
 def _validate_flashmla_sparse_q8_backend(
     *,
     prefill_impl: str,
@@ -3225,6 +3243,14 @@ class DeepseekSparseAttnBackend(
         )
 
         assert self.workspace_buffer is not None
+        # The SM120 sparse kernel indexes one length per query row, while
+        # metadata.dsa_cache_seqlens_int32 is a per-request tensor padded to the
+        # captured batch size (extend) and stays per-request when the batch
+        # carries several query rows per request (target verify). Whenever the
+        # two disagree, derive the bound from the page table, which is already
+        # per row: the number of non-padding index slots is exactly how many
+        # entries that row may scan.
+        seq_lens = _sm120_row_seq_lens(seq_lens, page_table_1, q_all.shape[0])
         return flashinfer_sparse_mla_forward(
             q=q_all,
             kv_cache=kv_cache,
