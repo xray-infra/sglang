@@ -863,6 +863,22 @@ class TestNixlDirectIO(CustomTestCase):
         self.assertIsNotNone(hicache._bounce_set)
         self.assertIsNotNone(hicache._bounce_get)
 
+    def test_buffered_posix_for_non_page_aligned_hybrid_page(self):
+        """POSIX uses buffered I/O for hybrid pages not divisible by 4096 bytes."""
+        hicache = self._make_direct_io_hicache()
+        self.addCleanup(hicache.close)
+
+        # This pool's serialized hybrid page is 16 bytes, representing the
+        # non-4096-byte DS fused FP8 page case without requiring a model.
+        pool = MockHybridPool(expose_zero_copy=False)
+        hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+
+        self.assertFalse(hicache.file_manager.use_direct_io)
+        self.assertEqual(
+            hicache._hybrid_pool_ctx[PoolName.MAMBA].bounce_page_bytes,
+            16,
+        )
+
     def test_odirect_disabled_via_config(self):
         """Top-level use_direct_io=false in extra_config disables O_DIRECT."""
         storage_config = HiCacheStorageConfig(
