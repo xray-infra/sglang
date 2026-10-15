@@ -1043,6 +1043,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "HYV4ForCausalLM",
         # Qwen4-Exp ships its NEXTN draft layer inside the target checkpoint.
         "Qwen4ExpForConditionalGeneration",
+        # GLM-5.3 (non-Flash) ships its NEXTN draft layer inside the target checkpoint.
+        "Glm5NextForConditionalGeneration",
     ]:
         if cfg.speculative_draft_model_path is None:
             declare_resolution(
