@@ -727,8 +727,15 @@ def flashinfer_sparse_mla_forward(
     qk_rope_head_dim: int,
     sm_scale: float,
     skip_softmax_threshold_scale_factor: float | None,
-) -> torch.Tensor:
-    """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache.
+
+    ``return_lse`` is required for decode context parallelism: DCP ranks hold
+    disjoint KV shards and each computes a partial attention over the gathered
+    query heads, so the partials can only be combined through their log-sum-exp
+    (``dcp_a2a_lse_reduce`` in the model's attention forward).
+    """
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
     topk = indices.shape[1]
@@ -749,5 +756,11 @@ def flashinfer_sparse_mla_forward(
         bmm2_scale=1.0,
         kv_scale_format="arbitrary_fp32",
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        return_lse=return_lse,
+        return_lse_base="base2",
     )
+    if return_lse:
+        out, lse = result
+        # SM120 returns a flat [query_rows, heads] LSE; only the output keeps Q=1.
+        return out.squeeze(1), lse
     return result.squeeze(1)

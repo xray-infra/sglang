@@ -38,6 +38,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -421,7 +422,8 @@ def _sm120_row_seq_lens(
     the captured batch size on extend, and a target-verify batch keeps one entry
     per request while the query has one row per draft token. Both cases mismatch,
     so fall back to the page table -- it is already per row, and its count of
-    non-padding slots is exactly how many entries a row may scan.
+    non-padding slots is exactly how many entries a row may scan. A row with no
+    valid slot keeps a length of one so the kernel reads only masked padding.
     """
     if seq_lens.numel() == num_rows:
         return seq_lens
@@ -2436,6 +2438,9 @@ class DeepseekSparseAttnBackend(
                 seq_lens=metadata.dsa_cache_seqlens_int32,
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                metadata=metadata,
+                layer=layer,
+                topk_indices=topk_indices,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2612,6 +2617,9 @@ class DeepseekSparseAttnBackend(
                 seq_lens=metadata.dsa_cache_seqlens_int32,
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                metadata=metadata,
+                layer=layer,
+                topk_indices=topk_indices,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -3237,25 +3245,42 @@ class DeepseekSparseAttnBackend(
         seq_lens: torch.Tensor,
         sm_scale: float,
         skip_softmax_threshold_scale_factor: float | None,
-    ) -> torch.Tensor:
+        metadata: object | None = None,
+        layer: RadixAttention | None = None,
+        topk_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             flashinfer_sparse_mla_forward,
         )
 
         assert self.workspace_buffer is not None
-        # The SM120 sparse kernel indexes one length per query row, while
-        # metadata.dsa_cache_seqlens_int32 is a per-request tensor padded to the
-        # captured batch size (extend) and stays per-request when the batch
-        # carries several query rows per request (target verify). Whenever the
-        # two disagree, derive the bound from the page table, which is already
-        # per row: the number of non-padding index slots is exactly how many
-        # entries that row may scan.
-        seq_lens = _sm120_row_seq_lens(seq_lens, page_table_1, q_all.shape[0])
-        return flashinfer_sparse_mla_forward(
+        use_dcp = self.dcp_size > 1
+        if use_dcp:
+            # Each rank keeps only its own KV shard, so the shared top-k slots
+            # are filtered down to the entries this rank owns and packed to the
+            # front of each row. The surviving per-row count is then exactly the
+            # bound the kernel may scan. This mirrors the trtllm DCP path.
+            page_table_1, row_lens = localize_dcp_page_table(
+                self._dcp_page_table_cache,
+                metadata=metadata,
+                layer_id=layer.layer_id,
+                topk_indices=topk_indices,
+                page_table=page_table_1,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+            )
+            # A row whose slots all belong to other ranks would leave the kernel
+            # with nothing to read; point it at a real page and let
+            # fixup_zero_kv_rows blank its output below.
+            page_table_1[:, 0] = torch.where(row_lens == 0, 0, page_table_1[:, 0])
+            kernel_lens = row_lens.clamp_min(1)
+        else:
+            kernel_lens = _sm120_row_seq_lens(seq_lens, page_table_1, q_all.shape[0])
+        result = flashinfer_sparse_mla_forward(
             q=q_all,
             kv_cache=kv_cache,
             indices=page_table_1,
-            seq_lens=seq_lens,
+            seq_lens=kernel_lens,
             workspace_buffer=self.workspace_buffer,
             page_size=self.physical_page_size,
             kv_cache_dim=self.kv_cache_dim,
@@ -3264,7 +3289,19 @@ class DeepseekSparseAttnBackend(
             qk_rope_head_dim=self.qk_rope_head_dim,
             sm_scale=sm_scale,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            return_lse=use_dcp,
         )
+        if not use_dcp:
+            return result
+        out, lse = result
+        fixup_zero_kv_rows(
+            out,
+            lse,
+            row_lens,
+            self.get_device_int32_arange(q_all.shape[0] + 1),
+            max_seq_len=1,
+        )
+        return out, lse
 
     def _forward_flashmla_kv(
         self,
