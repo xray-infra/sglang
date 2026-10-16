@@ -3192,6 +3192,8 @@ class DeepseekV2Model(nn.Module):
                 and dsa_layer_skips_topk(self.config, self.end_layer)
             ):
                 topk_indices = index_topk_share.topk_indices
+                # hidden_states may be an opaque OwedOutput; to_pp completed it.
+                hidden_states = proxy_tensors.tensors["hidden_states"]
                 if (
                     not forward_batch.forward_mode.is_idle()
                     and hidden_states.shape[0] != 0
