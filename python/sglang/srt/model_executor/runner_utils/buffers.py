@@ -127,6 +127,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     ngram_embedding_info: Optional[NgramEmbeddingInfo]
     rids_int: Optional[torch.Tensor]
     bootstrap_room_ids_int: Optional[torch.Tensor]
+    global_num_token_non_padded: Optional[torch.Tensor] = None
 
     @classmethod
     def create(
@@ -164,6 +165,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             # Refreshed at replay only under expert parallelism.
             num_token_non_padded = (
+                torch.zeros((1,), dtype=torch.int32)
+                if enable_num_token_non_padded()
+                else None
+            )
+            global_num_token_non_padded = (
                 torch.zeros((1,), dtype=torch.int32)
                 if enable_num_token_non_padded()
                 else None
@@ -266,6 +272,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             ngram_embedding_info=ngram_embedding_info,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
+            global_num_token_non_padded=global_num_token_non_padded,
         )
 
 
