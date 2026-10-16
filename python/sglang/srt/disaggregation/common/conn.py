@@ -1292,10 +1292,32 @@ class CommonKVManager(BaseKVManager):
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )
-            target_tp_rank = (self.kv_args.engine_rank % self.attn_tp_size) // (
-                self.attn_tp_size // info.attn_tp_size
-            )
-            required_dst_info_num = self.attn_tp_size // info.attn_tp_size
+            ratio = self.attn_tp_size // info.attn_tp_size
+            local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+            if (
+                self.dcp_size > 1
+                and self.is_mla_backend
+                and not self.is_hybrid_mla_backend
+                and info.attn_tp_size % self.dcp_size == 0
+            ):
+                # Each DCP group is a contiguous run of dcp_size TP ranks on both
+                # sides. Pick the prefill rank holding the same DCP shard; the
+                # prefill side still rejects any DCP rank mismatch. Pure MLA
+                # only: its KV is replicated across a DCP1 prefill's TP ranks,
+                # while hybrid-MLA state and draft head slicing derive source
+                # offsets from the block mapping below.
+                if local_tp_rank % self.dcp_size != self.dcp_rank:
+                    raise RuntimeError(
+                        "PD decode DCP expects contiguous DCP groups, got "
+                        f"tp_rank={local_tp_rank} dcp_rank={self.dcp_rank} "
+                        f"dcp_size={self.dcp_size}"
+                    )
+                target_tp_rank = (
+                    local_tp_rank // self.dcp_size // ratio
+                ) * self.dcp_size + self.dcp_rank
+            else:
+                target_tp_rank = local_tp_rank // ratio
+            required_dst_info_num = ratio
             required_prefill_response_num = 1
             target_tp_ranks = [target_tp_rank]
         else:
