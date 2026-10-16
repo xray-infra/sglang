@@ -215,6 +215,35 @@ class TestShortestPrefillFirst(CustomTestCase):
                     )
                 )
 
+    def test_no_reservation_without_a_free_request_slot(self):
+        # A PP micro batch of one (max_running_requests // pp_size == 1) holds
+        # only the continuation; reserving would shrink it to one page forever.
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req("short", 3840)]
+        for max_reqs in (0, -1):
+            with self.subTest(max_reqs=max_reqs):
+                self.assertIsNone(
+                    self.policy.shortest_prefill_chunk_limit(
+                        continuation, waiting, 4096, 256, max_reqs=max_reqs
+                    )
+                )
+
+    def test_reservation_stops_at_free_request_slots(self):
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, max_reqs=1
+            ),
+            3584,
+        )
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, max_reqs=2
+            ),
+            2560,
+        )
+
     def test_other_policy_keeps_normal_chunk_limit(self):
         self.policy.policy = CacheAwarePolicy.HRRN
         self.assertIsNone(
