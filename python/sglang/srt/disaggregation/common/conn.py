@@ -1294,10 +1294,18 @@ class CommonKVManager(BaseKVManager):
                 )
             ratio = self.attn_tp_size // info.attn_tp_size
             local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
-            if self.dcp_size > 1 and info.attn_tp_size % self.dcp_size == 0:
+            if (
+                self.dcp_size > 1
+                and self.is_mla_backend
+                and not self.is_hybrid_mla_backend
+                and info.attn_tp_size % self.dcp_size == 0
+            ):
                 # Each DCP group is a contiguous run of dcp_size TP ranks on both
                 # sides. Pick the prefill rank holding the same DCP shard; the
-                # prefill side still rejects any DCP rank mismatch.
+                # prefill side still rejects any DCP rank mismatch. Pure MLA
+                # only: its KV is replicated across a DCP1 prefill's TP ranks,
+                # while hybrid-MLA state and draft head slicing derive source
+                # offsets from the block mapping below.
                 if local_tp_rank % self.dcp_size != self.dcp_rank:
                     raise RuntimeError(
                         "PD decode DCP expects contiguous DCP groups, got "

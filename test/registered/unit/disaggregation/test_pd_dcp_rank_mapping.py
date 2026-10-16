@@ -8,12 +8,12 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _target(*, decode_tp, decode_dcp, prefill_tp, engine_rank):
+def _target(*, decode_tp, decode_dcp, prefill_tp, engine_rank, hybrid=False):
     mgr = SimpleNamespace(
         attn_tp_size=decode_tp,
         kv_args=SimpleNamespace(engine_rank=engine_rank),
-        is_mla_backend=True,
-        is_hybrid_mla_backend=False,
+        is_mla_backend=not hybrid,
+        is_hybrid_mla_backend=hybrid,
         dcp_size=decode_dcp,
         dcp_rank=engine_rank % decode_dcp,
         attn_cp_size=1,
@@ -64,6 +64,17 @@ class TestDecodeDcpRankMapping(CustomTestCase):
                 for r in range(8)
             ]
             self.assertEqual(got, [r // ratio for r in range(8)])
+
+    def test_hybrid_mla_keeps_block_mapping(self):
+        # Hybrid-MLA state and draft head slicing derive source offsets from
+        # the block mapping, so the shard-matching mapping is pure MLA only.
+        got = [
+            _target(
+                decode_tp=8, decode_dcp=4, prefill_tp=4, engine_rank=r, hybrid=True
+            ).target_tp_rank
+            for r in range(8)
+        ]
+        self.assertEqual(got, [r // 2 for r in range(8)])
 
     def test_without_decode_dcp_mapping_is_unchanged(self):
         got = [
