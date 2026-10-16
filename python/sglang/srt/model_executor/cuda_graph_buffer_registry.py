@@ -544,8 +544,10 @@ def build_decode_registry(
       - ``positions`` / ``mrope_positions`` -> ZERO: the flashinfer verify-path
         plan reads the padded tail, so leaving stale out-of-range values there
         triggers an illegal memory access (issue #24361).
-      - ``input_ids`` -> FOREACH_COPY: head ``[:raw_n]`` is overwritten by the
-        copy and the padded tail is not read.
+      - ``input_ids`` -> ZERO: padded rows still run the forward. A sparse MoE
+        routes them unless they are masked, and a stale tail (tokens left by an
+        earlier, larger batch) spreads them across many experts, so the cost of
+        a small batch would depend on the batches before it.
 
     ``custom_mask`` / ``next_token_logits_buffer`` / ``input_embeds`` are not
     registered here — they are not per-replay FB copies (allocated and written
@@ -570,7 +572,13 @@ def build_decode_registry(
         return (bs,)
 
     slots = [
-        GraphSlot("input_ids", _tokens, torch.int64, axis="tokens"),
+        GraphSlot(
+            "input_ids",
+            _tokens,
+            torch.int64,
+            axis="tokens",
+            padding_policy=PaddingPolicy.ZERO,
+        ),
         GraphSlot(
             "positions",
             _tokens,
@@ -687,6 +695,26 @@ def build_decode_registry(
                 axis="none",
                 copy_from_fb=False,
                 post_fill=_num_token_non_padded_post_fill,
+            )
+        )
+
+        def _global_num_token_non_padded_post_fill(buf, fb, ctx):
+            # A sequence-sharded forward bounds its full-width MoE input by the
+            # GLOBAL count (ForwardBatch.moe_num_token_non_padded); batches that
+            # bypass init_new carry none, and their real rows are the raw ones.
+            if fb.global_num_token_non_padded is not None:
+                buf.copy_(fb.global_num_token_non_padded)
+            else:
+                buf.fill_(ctx.raw_num_tokens)
+
+        slots.append(
+            GraphSlot(
+                "global_num_token_non_padded",
+                lambda _bs, _mt: (1,),
+                torch.int32,
+                axis="none",
+                copy_from_fb=False,
+                post_fill=_global_num_token_non_padded_post_fill,
             )
         )
 

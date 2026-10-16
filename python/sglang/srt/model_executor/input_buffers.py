@@ -42,10 +42,13 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
 
 
 # Values that index the rope table, the KV pool, req_to_token, or the mamba
-# state pool, so stale content is unsafe to execute. build_decode_registry
-# asserts its ZERO-policy slots against this set.
+# state pool, so stale content is unsafe to execute. input_ids indexes the
+# embedding table and steers MoE routing of padded rows: stale ids are safe to
+# run but make a small batch's cost depend on earlier, larger ones.
+# build_decode_registry asserts its ZERO-policy slots against this set.
 INDEX_SEMANTIC_BUFFERS = frozenset(
     {
+        "input_ids",
         "positions",
         "mrope_positions",
         "out_cache_loc",

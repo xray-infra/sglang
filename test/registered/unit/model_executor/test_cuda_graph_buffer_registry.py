@@ -729,10 +729,11 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             padded_num_tokens=padded_nt,
         )
 
-        # FOREACH_COPY: head copied, tail kept (poison).
+        # ZERO: padded rows still run the forward (MoE routes them), so a stale
+        # tail from an earlier larger batch must not survive into this replay.
         ids = reg.get_slot("input_ids").buffer
         self.assertTrue(torch.equal(ids[:2], torch.tensor([10, 11])))
-        self.assertTrue(torch.equal(ids[2:4], torch.tensor([99, 99])))
+        self.assertTrue(torch.equal(ids[2:4], torch.tensor([0, 0])))
         # ZERO: head copied, tail zeroed.
         oc = reg.get_slot("out_cache_loc").buffer
         self.assertTrue(torch.equal(oc[:2], torch.tensor([100, 101])))
@@ -815,6 +816,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             num_token_non_padded=ntnp,
+            global_num_token_non_padded=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
         )
@@ -842,6 +844,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         # tokens_per_rank = padded_num_tokens(8) // attn_tp_size(2) = 4;
         # local = clamp(global(100) - rank*4, 0, 4) = 4.
         self.assertEqual(int(src.num_token_non_padded.item()), 4)
+        # The GLOBAL slot keeps the unsharded count for the full-width MoE input.
+        self.assertEqual(int(src.global_num_token_non_padded.item()), 100)
 
     def test_num_token_non_padded_bypass_carries_local_count(self):
         # Regression: the dense SBD draft and TBO sub-batches bypass
@@ -864,6 +868,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             num_token_non_padded=ntnp,
+            global_num_token_non_padded=torch.full((1,), 99, dtype=torch.int32),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
         )
@@ -890,6 +895,9 @@ class TestBuildDecodeRegistry(unittest.TestCase):
                 fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
             )
         self.assertEqual(int(src.num_token_non_padded.item()), 7)
+        # No GLOBAL on the batch: the real rows are the raw ones, never the
+        # poisoned value left by an earlier replay.
+        self.assertEqual(int(src.global_num_token_non_padded.item()), 4)
 
     def test_register_global_num_tokens_false_carries_fb_values(self):
         # register_global_num_tokens=False (eager) excludes the computed
