@@ -177,7 +177,10 @@ def create_moe_dispatcher(
         # StandardDispatcher is created but never invoked.
         # flashinfer_megamoe does its EP all-to-all inside the kernel, so the
         # dispatcher stays a pure noop passthrough.
-        return StandardDispatcher(moe_runner_config)
+        return StandardDispatcher(
+            moe_runner_config,
+            runner_backend=getattr(quant_method, "dispatch_runner_backend", None),
+        )
     elif (
         a2a_backend.is_deepep()
         or a2a_backend.is_mooncake()
