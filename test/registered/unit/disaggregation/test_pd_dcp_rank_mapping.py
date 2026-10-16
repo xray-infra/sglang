@@ -67,8 +67,9 @@ class TestDecodeDcpRankMapping(CustomTestCase):
 
     def test_without_decode_dcp_mapping_is_unchanged(self):
         got = [
-            _target(decode_tp=8, decode_dcp=1, prefill_tp=4, engine_rank=r)
-            .target_tp_rank
+            _target(
+                decode_tp=8, decode_dcp=1, prefill_tp=4, engine_rank=r
+            ).target_tp_rank
             for r in range(8)
         ]
         self.assertEqual(got, [r // 2 for r in range(8)])
@@ -89,7 +90,10 @@ class TestDecodeDcpRankMapping(CustomTestCase):
             pp_rank=0,
         )
         info = SimpleNamespace(
-            attn_tp_size=4, attn_cp_size=1, pp_size=1, enable_dsa_cache_layer_split=False
+            attn_tp_size=4,
+            attn_cp_size=1,
+            pp_size=1,
+            enable_dsa_cache_layer_split=False,
         )
         with self.assertRaisesRegex(RuntimeError, "contiguous DCP groups"):
             CommonKVManager._resolve_rank_mapping(mgr, info)
