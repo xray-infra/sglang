@@ -127,11 +127,20 @@ def awq_dequantize_func():
 def enable_nextn_moe_bf16_cast_to_fp8(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    return (
+    if not (
         envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
         and quant_config is not None
         and quant_config.get_name() == "modelopt_fp4"
-        and get_moe_runner_backend().is_deep_gemm()
+    ):
+        return False
+    backend = get_moe_runner_backend()
+    # Fp8MoEMethod runs flashinfer_cutlass / flashinfer_cutedsl (pinned for the
+    # NVFP4 experts on sm120) on triton, so those take the block-FP8 cast too.
+    return (
+        backend.is_deep_gemm()
+        or backend.is_triton()
+        or backend.is_flashinfer_cutlass()
+        or backend.is_flashinfer_cutedsl()
     )
 
 

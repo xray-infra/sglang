@@ -25,7 +25,10 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FusedMoE,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
@@ -839,6 +842,7 @@ class DeepseekV2WeightLoaderMixin:
         """
         weight_block_size = [128, 128]
         partial_names = []
+        mark_nextn_moe_ue8m0 = False
 
         match nextn_conf:
             case NextNEnabledConfig(nextn_layer_id=layer_id):
@@ -848,7 +852,12 @@ class DeepseekV2WeightLoaderMixin:
                             f"model.layers.{layer_id}.self_attn.{stem}"
                         )
 
-                if enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+                if not enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+                    pass
+                elif not get_moe_runner_backend().is_deep_gemm():
+                    weights = self._stream_nextn_mlp_to_fp8_block(weights, layer_id)
+                else:
+                    mark_nextn_moe_ue8m0 = True
                     expert_sub_names = ["shared_experts"] + [
                         f"experts.{i}" for i in range(self.config.n_routed_experts)
                     ]
@@ -881,12 +890,46 @@ class DeepseekV2WeightLoaderMixin:
             weights_dict[f"{partial_name}.weight"] = out_w
             weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
 
-        if isinstance(
-            nextn_conf, NextNEnabledConfig
-        ) and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+        if mark_nextn_moe_ue8m0:
             self._mark_nextn_moe_weights_as_ue8m0()
 
         return list(weights_dict.items())
+
+    def _stream_nextn_mlp_to_fp8_block(self, weights, layer_id: int):
+        """Cast the NextN layer's bf16 expert / shared-expert projections to
+        128x128 block FP8 as they stream past, for the triton runner. The scales
+        are the DeepGEMM path's power-of-two values kept as FP32, so triton
+        needs no UE8M0 marking. One tensor at a time, so the rest of the
+        checkpoint is never materialized."""
+        prefix = f"model.layers.{layer_id}.mlp."
+        weight_block_size = [128, 128]
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else None
+        )
+        log_info_on_rank0(
+            logger, f"Casting NextN MLP weights under {prefix} to block FP8 on load"
+        )
+
+        def _cast():
+            for name, tensor in weights:
+                if not (
+                    name.startswith(prefix)
+                    and name.endswith("_proj.weight")
+                    and (".experts." in name or ".shared_experts." in name)
+                ):
+                    yield name, tensor
+                    continue
+                if device is not None:
+                    tensor = tensor.to(device)
+                out_w, out_s = quant_weight_ue8m0(
+                    tensor, weight_block_size=weight_block_size
+                )
+                yield name, out_w
+                yield name[: -len("weight")] + "weight_scale_inv", out_s
+
+        return _cast()
 
     def _mark_nextn_moe_weights_as_ue8m0(self):
         """Mark NextN MoE weight scales as UE8M0 format to avoid requantization."""

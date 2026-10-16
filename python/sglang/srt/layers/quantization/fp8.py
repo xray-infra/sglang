@@ -2858,6 +2858,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend.name,
             )
             moe_runner_backend = MoeRunnerBackend.TRITON
+            # The dispatcher would otherwise follow the pinned backend and keep
+            # global expert ids, which triton reads as local ones under EP.
+            self.dispatch_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_deep_gemm()

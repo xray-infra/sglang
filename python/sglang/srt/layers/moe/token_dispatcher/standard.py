@@ -44,6 +44,7 @@ _MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.utils import MoeRunnerBackendLike
 
 
 try:
@@ -92,10 +93,19 @@ assert isinstance(StandardCombineInput, CombineInput)
 
 
 class StandardDispatcher(BaseDispatcher):
-    def __init__(self, moe_runner_config: MoeRunnerConfig):
+    def __init__(
+        self,
+        moe_runner_config: MoeRunnerConfig,
+        runner_backend: Optional[MoeRunnerBackendLike] = None,
+    ):
         super().__init__()
         self.moe_ep_size = get_parallel().moe_ep_size
-        backend = get_moe_runner_backend()
+        # runner_backend: the runner the layer's quant method actually built when
+        # it differs from --moe-runner-backend (Fp8MoEMethod runs triton under a
+        # flashinfer_cutlass pin). It decides whether expert ids are made local;
+        # handing global ids to a runner that indexes local experts is an
+        # out-of-bounds weight read under EP.
+        backend = runner_backend or get_moe_runner_backend()
         self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
         self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
         self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
