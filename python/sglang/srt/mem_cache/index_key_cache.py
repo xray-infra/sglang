@@ -148,7 +148,13 @@ class IndexKeyCache:
     def _item_len(self, layer_idx: int) -> int:
         # 0-row layers (skip-topk, or non-owned under CP layer split) have no item.
         buf = self.buffer[layer_idx]
-        return 0 if buf.shape[0] == 0 else buf[0].nbytes
+        if buf.shape[0] == 0:
+            return 0
+        # PD pages the DSA state with the device pool's 64-token kernel page on
+        # both sides, and target and draft entries share one index list. A
+        # DCP-replicated draft pool packs dcp_size kernel pages per row, so the
+        # transfer stride is the kernel page, not the row.
+        return self._kernel_view(buf)[0].nbytes
 
     def state_buf_infos(self):
         layer_num = self.pool.layer_num
