@@ -256,5 +256,90 @@ class TestShortestPrefillFirst(CustomTestCase):
         )
 
 
+class TestShortestPrefillFirstAging(CustomTestCase):
+    """SGLANG_SPF_MAX_WAIT_TOKENS: bounded wait for long prefills under SPF."""
+
+    def setUp(self):
+        self.policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+    def make_req(self, rid, uncached, *, arrival_tokens=0, arrived=0.0):
+        req = _make_req(rid, "", list(range(uncached)))
+        req.full_untruncated_fill_ids = req.origin_input_ids[:]
+        req.num_matched_prefix_tokens = 0
+        req.prefix_len = 0
+        req.arrival_processed_tokens = arrival_tokens
+        req.time_stats.wait_queue_entry_time = arrived
+        return req
+
+    def queue(self):
+        # long1 arrived before 1M prefill tokens ran, long2 after 300K, the
+        # shorts just now.
+        return [
+            self.make_req("short", 512, arrival_tokens=1_000_000, arrived=3),
+            self.make_req("long2", 131072, arrival_tokens=700_000, arrived=2),
+            self.make_req("mid", 4096, arrival_tokens=1_000_000, arrived=3),
+            self.make_req("long1", 262144, arrival_tokens=0, arrived=1),
+        ]
+
+    def calc(self, queue, max_wait_tokens):
+        with (
+            patch.object(self.policy, "_compute_prefix_matches", return_value=set()),
+            patch(
+                "sglang.srt.managers.schedule_policy.envs.SGLANG_SPF_MAX_WAIT_TOKENS.get",
+                return_value=max_wait_tokens,
+            ),
+        ):
+            self.policy.calc_priority(queue, processed_tokens=1_000_000)
+        return [req.rid for req in queue]
+
+    def test_disabled_keeps_shortest_first(self):
+        self.assertEqual(self.calc(self.queue(), 0), ["short", "mid", "long2", "long1"])
+        self.assertEqual(self.policy.spf_aged_rids, set())
+
+    def test_aged_requests_go_first_oldest_first(self):
+        # Threshold 300K: long1 (waited 1M) and long2 (waited 300K) are aged.
+        self.assertEqual(
+            self.calc(self.queue(), 300_000), ["long1", "long2", "short", "mid"]
+        )
+        self.assertEqual(self.policy.spf_aged_rids, {"long1", "long2"})
+        # Threshold 500K: only long1.
+        self.assertEqual(
+            self.calc(self.queue(), 500_000), ["long1", "short", "mid", "long2"]
+        )
+        self.assertEqual(self.policy.spf_aged_rids, {"long1"})
+
+    def test_duplicate_prefix_still_deferred(self):
+        queue = self.queue()
+        with (
+            patch.object(
+                self.policy, "_compute_prefix_matches", return_value={"long1"}
+            ),
+            patch(
+                "sglang.srt.managers.schedule_policy.envs.SGLANG_SPF_MAX_WAIT_TOKENS.get",
+                return_value=300_000,
+            ),
+        ):
+            self.policy.calc_priority(queue, processed_tokens=1_000_000)
+        self.assertEqual([r.rid for r in queue], ["long2", "short", "mid", "long1"])
+
+    def test_chunk_limit_reserves_past_aged_requests(self):
+        # The aged long request heads the queue; the reservation for the
+        # shorter requests behind it must not stop at it.
+        continuation = self.make_req("continuation", 16384)
+        queue = self.queue()
+        self.calc(queue, 500_000)
+        # Reserves the 512-token request; the 4096-token one does not fit.
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(continuation, queue, 4096, 256),
+            4096 - 512,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -254,10 +254,21 @@ class TestPrefillAdder(CustomTestCase):
             adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
             AddReqResult.OTHER,
         )
+        # The scheduler lets an aged shortest-prefill-first request wait for
+        # the slot without ending admission, so the reason must be visible.
+        self.assertTrue(adder.last_chunk_slot_busy)
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(adder.new_chunked_req)
         self.assertIsNone(req.extend_end)
         self.mock_tree_cache.init_load_back.assert_not_called()
+
+        short = self.create_shared_req("short")
+        short.full_untruncated_fill_ids = list(range(256))
+        self.assertEqual(
+            adder.add_one_req(short, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        self.assertFalse(adder.last_chunk_slot_busy)
 
     def test_rejects_second_unfinished_chunk_in_same_admission(self):
         """A chunked candidate admitted earlier in the same pass is published only
@@ -273,7 +284,9 @@ class TestPrefillAdder(CustomTestCase):
         second.full_untruncated_fill_ids = list(range(16384))
 
         self.assertEqual(
-            adder.add_one_req(second, has_chunked_req=False, truncation_align_size=None),
+            adder.add_one_req(
+                second, has_chunked_req=False, truncation_align_size=None
+            ),
             AddReqResult.OTHER,
         )
         self.assertEqual(adder.can_run_list, [])

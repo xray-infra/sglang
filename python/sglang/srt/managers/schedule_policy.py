@@ -201,6 +201,9 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
+        # Requests shortest-prefill-first aging moved to the front in the last
+        # calc_priority (see _sort_by_shortest_prefill).
+        self.spf_aged_rids: Set[str] = set()
         self._waiting_prefix_refresh_calls = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
@@ -244,8 +247,11 @@ class SchedulePolicy:
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-                SchedulePolicy._sort_by_shortest_prefill(
-                    waiting_queue, temporary_deprioritized
+                self.spf_aged_rids = SchedulePolicy._sort_by_shortest_prefill(
+                    waiting_queue,
+                    temporary_deprioritized,
+                    processed_tokens,
+                    envs.SGLANG_SPF_MAX_WAIT_TOKENS.get(),
                 )
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
@@ -400,16 +406,45 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_shortest_prefill(
-        waiting_queue: List[Req], temporary_deprioritized: Set[int]
-    ) -> None:
-        # Prioritize short uncached prefills while deferring duplicate prefixes.
-        waiting_queue.sort(
-            key=lambda r: (
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        processed_tokens: int = 0,
+        max_wait_tokens: int = 0,
+    ) -> Set[str]:
+        """Prioritize short uncached prefills while deferring duplicate prefixes.
+
+        Under sustained load shorter requests keep arriving and a long one can
+        wait indefinitely; in PD it also holds its decode KV reservation all that
+        time. With max_wait_tokens > 0, a request that has waited while that many
+        prefill tokens ran (processed_tokens - arrival_processed_tokens, the HRRN
+        counter, identical on every rank) is aged: aged requests go first, oldest
+        first, ahead of the shortest-first order of the rest. Returns their rids.
+
+        An aged request that needs the single chunk slot while a continuation
+        holds it is passed over for the pass instead of ending admission (see
+        Scheduler), and takes the slot in the pass the continuation finishes.
+        """
+        aged: Set[str] = set()
+
+        def key(r: Req):
+            waited = processed_tokens - r.arrival_processed_tokens
+            if max_wait_tokens > 0 and waited >= max_wait_tokens:
+                aged.add(r.rid)
+                return (
+                    r.rid in temporary_deprioritized,
+                    0,
+                    r.arrival_processed_tokens,
+                    r.time_stats.wait_queue_entry_time,
+                )
+            return (
                 r.rid in temporary_deprioritized,
+                1,
                 SchedulePolicy._shortest_prefill_work(r),
                 r.time_stats.wait_queue_entry_time,
             )
-        )
+
+        waiting_queue.sort(key=key)
+        return aged
 
     def shortest_prefill_chunk_limit(
         self,
@@ -438,6 +473,10 @@ class SchedulePolicy:
         for req in waiting_queue:
             if max_reqs is not None and num_reserved >= max_reqs:
                 break
+            if req.rid in self.spf_aged_rids:
+                # Aged requests sit ahead of the shortest-first order; they
+                # wait for the chunk slot, they are not what this reserves for.
+                continue
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
             if work >= remaining or reserved + charge > budget - page_size:
@@ -646,6 +685,9 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        # The last add_one_req returned OTHER only because the request needs
+        # chunking and the single chunk slot is taken.
+        self.last_chunk_slot_busy = False
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_device_hit_tokens = 0
@@ -1363,6 +1405,7 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        self.last_chunk_slot_busy = False
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
@@ -1583,6 +1626,7 @@ class PrefillAdder:
             # publishes the new request after this admission pass, so the
             # in-pass marker is needed to reject a second chunked candidate too.
             if has_chunked_req or self.new_chunked_req is not None:
+                self.last_chunk_slot_busy = True
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly

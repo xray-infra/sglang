@@ -4209,6 +4209,14 @@ class Scheduler(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.kv.mamba_pool_idx = None
+                if (
+                    res == AddReqResult.OTHER
+                    and adder.last_chunk_slot_busy
+                    and req.rid in self.policy.spf_aged_rids
+                ):
+                    # An aged request only waits for the chunk slot; shorter
+                    # requests behind it still fit this pass.
+                    continue
                 break
 
         if mamba_allocator is not None:
