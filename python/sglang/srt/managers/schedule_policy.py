@@ -412,22 +412,38 @@ class SchedulePolicy:
         )
 
     def shortest_prefill_chunk_limit(
-        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        max_reqs: Optional[int] = None,
     ) -> Optional[int]:
-        """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
+        """Cap the active prefill chunk to reserve tokens for shorter waiting requests.
+
+        max_reqs bounds how many waiting requests the pass can still admit
+        besides the continuation. Reserving for a request that cannot be
+        admitted only shrinks the continuation; with no free slot (e.g. a PP
+        micro batch of one) every pass would run a page-sized chunk.
+        """
         if (
             self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
             or budget < 2 * page_size
+            or (max_reqs is not None and max_reqs <= 0)
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
         reserved = 0
+        num_reserved = 0
         for req in waiting_queue:
+            if max_reqs is not None and num_reserved >= max_reqs:
+                break
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
             if work >= remaining or reserved + charge > budget - page_size:
                 break
             reserved += charge
+            num_reserved += 1
         if not reserved:
             return None
         # Page alignment keeps continuation boundaries allocator-compatible.

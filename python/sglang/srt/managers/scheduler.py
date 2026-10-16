@@ -4074,11 +4074,24 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            # Slots the admission loop below leaves for waiting requests once
+            # the continuation occupies one of them.
+            free_slots = (
+                self.get_num_allocatable_reqs(
+                    running_bs,
+                    running_batch=running_batch,
+                    num_held_rows=int(self.chunked_req.kv.holds_kv),
+                )
+                - 1
+            )
+            if (x := get_schedule().prefill_max_requests) is not None:
+                free_slots = min(free_slots, x - 1)
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 self.chunked_req,
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
+                max_reqs=free_slots,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
