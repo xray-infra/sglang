@@ -606,6 +606,10 @@ class Envs:
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
+    # shortest-prefill-first aging: a request that has waited while this many
+    # prefill tokens ran goes ahead of every fresh one (oldest first). Counted
+    # in tokens, not seconds, so every rank sorts the same. 0 disables.
+    SGLANG_SPF_MAX_WAIT_TOKENS = EnvInt(0)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
     # Compact extend-attention scheduler tile-budget admission (AMD/HIP-only).
     # Budget <= 0 disables; >0 sets the max prefix-extend tiles per batch.
