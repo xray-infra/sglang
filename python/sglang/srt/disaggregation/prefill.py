@@ -1126,6 +1126,29 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if rids_to_check is not None and req.pending_bootstrap:
+                # PP + prefill_complete parks a finished request here until
+                # decode publishes destinations. Finalizing and sending touch
+                # only this stage's transfer (the batch result already
+                # checkpointed the KV), so each stage does it on its own poll.
+                # Concluding releases KV, which every stage must do in the same
+                # step, so a failure waits for consensus like any other.
+                if poll == KVPoll.WaitingForInput:
+                    if self.handle_pending_bootstrap(req, poll, checkpoint=False):
+                        self.send_kv_chunk(req, last_chunk=True)
+                    undone_reqs.append(req)
+                    continue
+                if poll != KVPoll.Failed or req.rid not in rids_to_check:
+                    undone_reqs.append(req)
+                    continue
+                # Another stage may have concluded this room with Success; release
+                # the KV exactly as a failed transfer does so the trees match.
+                req.pending_bootstrap = False
+                self.clear_pending_chunk_send(req)
+                self.handle_inflight_transfer_failure(req)
+                done_reqs.append(req)
+                continue
+
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1334,8 +1357,15 @@ class SchedulerDisaggregationPrefillMixin:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
-    def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
-        """Return True when bootstrap is finalized and KV transfer can proceed."""
+    def handle_pending_bootstrap(
+        self: Scheduler, req: Req, poll: KVPoll, *, checkpoint: bool = True
+    ) -> bool:
+        """Return True when bootstrap is finalized and KV transfer can proceed.
+
+        checkpoint=False skips re-checkpointing a request whose final batch
+        result already checkpointed it (a radix-tree change at a per-stage
+        moment would desynchronize pipeline stages).
+        """
         if poll == KVPoll.Failed:
             self.handle_bootstrap_failure(req)
             return False
@@ -1347,7 +1377,8 @@ class SchedulerDisaggregationPrefillMixin:
             # Metadata buffer was allocated in pop_bootstrapped before
             # the request entered the waiting queue, so finalize should not fail.
             assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
-            self.checkpoint_disagg_prefill(req)
+            if checkpoint:
+                self.checkpoint_disagg_prefill(req)
             return True
         else:
             raise RuntimeError(
@@ -1376,7 +1407,18 @@ class SchedulerDisaggregationPrefillMixin:
             reqs_to_exclude.add(req)
             self.checkpoint_disagg_prefill(req)
 
-            if not self.check_bootstrap(req):
+            if (
+                req.pending_bootstrap
+                and get_parallel().pp_size > 1
+                and get_disagg().disaggregation_decode_allocation_policy
+                == "prefill_complete"
+            ):
+                # Decode publishes destinations only after the final chunk, so
+                # there is nothing to send yet. A per-stage poll could see a
+                # failure on one stage only and drop the continuation there;
+                # failures conclude after the final chunk on PP consensus.
+                pass
+            elif not self.check_bootstrap(req):
                 if is_aborted(req):
                     # bootstrap failed
                     self.chunked_req = None

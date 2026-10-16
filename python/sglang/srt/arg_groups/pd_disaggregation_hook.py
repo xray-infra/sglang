@@ -202,11 +202,21 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         unsupported.append("aggregated serving")
     if cfg.disaggregation_transfer_backend != "mooncake":
         unsupported.append("transfer backends other than Mooncake")
-    if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
-        unsupported.append("pipeline or attention context parallelism")
+    if cfg.attn_cp_size != 1:
+        unsupported.append("attention context parallelism")
     attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
-    if cfg.tp_size != attn_dp_size:
-        unsupported.append("attention tensor parallelism greater than one")
+    if cfg.disaggregation_mode == "decode":
+        # Every decode TP rank registers with the prefill rank it maps onto,
+        # and the prefill notifies all of them; DCP only changes the layout.
+        if cfg.pp_size != 1:
+            unsupported.append("decode pipeline parallelism")
+    else:
+        # One authoritative rank per pipeline stage; each stage signals
+        # readiness for its own layers.
+        if cfg.dcp_size != 1:
+            unsupported.append("prefill decode context parallelism")
+        if cfg.tp_size != attn_dp_size:
+            unsupported.append("prefill attention tensor parallelism greater than one")
     if cfg.enable_pdmux or cfg.decoupled_spec_role != "null":
         unsupported.append("PD multiplexing or decoupled speculation")
     if cfg.enable_pd_role_switch:
