@@ -278,6 +278,11 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
+                # abort_request only marks an in-flight chunked request; without
+                # this the aborted request keeps prefilling every chunk. Every
+                # stage ingests the abort in the same micro-batch step, so all
+                # stages drop the continuation together.
+                self.process_pending_chunked_abort()
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
