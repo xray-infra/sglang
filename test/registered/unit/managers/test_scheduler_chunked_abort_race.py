@@ -96,5 +96,40 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         self.assertEqual(abort_req.finished_reason, req.discard_output_reason.to_json())
 
 
+class TestPPPrefillLoopAppliesChunkedAbort(CustomTestCase):
+    def test_pending_abort_is_applied_before_the_next_chunk(self):
+        # Without this the PP disagg prefill loop never consumes the marker
+        # and an aborted chunked request keeps prefilling to the end.
+        enter_scope(self, published_topology(pp_size=2))
+        calls = Mock()
+        running_batch = SimpleNamespace(batch_is_full=False)
+        sched = Scheduler.__new__(Scheduler)
+        sched.init_pp_loop_state = Mock()
+        sched.pp_loop_size = 1
+        sched.pp_group = SimpleNamespace(is_last_rank=True)
+        sched.running_mbs = [running_batch]
+        sched.last_mbs = [None]
+        sched.ingest_requests = Mock(return_value=[])
+        sched.waiting_queue = []
+        sched.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            pop_bootstrapped=lambda: []
+        )
+        sched._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
+        sched._pp_commit_comm_work = Mock()
+        sched.process_pending_chunked_abort = calls.abort
+        sched.process_prefill_chunk = calls.chunk
+        sched._process_hicache_events = calls.hicache
+        sched.get_new_batch_prefill = calls.admit
+        # Stop the infinite loop at admission; no PP transport or GPU is needed.
+        sched.get_new_batch_prefill.side_effect = StopIteration
+
+        with self.assertRaises(StopIteration):
+            sched.event_loop_pp_disagg_prefill()
+
+        self.assertEqual(
+            [c[0] for c in calls.mock_calls], ["abort", "chunk", "hicache", "admit"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
