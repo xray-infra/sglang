@@ -600,17 +600,18 @@ class CommonKVManager(BaseKVManager):
         self.request_status[bootstrap_room] = max(current, status)
 
     def _notify_bootstrap(self, room: int, notification: BootstrapNotification) -> None:
-        if notification is None:
-            return
-        endpoint, failed = notification
-        # Use the normal status channel; readiness does not authorize writes.
-        # No room-table lock is held while sending to a potentially dead peer.
-        self.send_kv_status_message(
-            targets=[endpoint],
-            bootstrap_room=room,
-            status=KVPoll.Failed if failed else KVPoll.WaitingForInput,
-            failure_reason="Prefill bootstrap failed" if failed else None,
-        )
+        for failed in (True, False):
+            targets = [endpoint for endpoint, f in notification if f is failed]
+            if not targets:
+                continue
+            # Use the normal status channel; readiness does not authorize writes.
+            # No room-table lock is held while sending to a potentially dead peer.
+            self.send_kv_status_message(
+                targets=targets,
+                bootstrap_room=room,
+                status=KVPoll.Failed if failed else KVPoll.WaitingForInput,
+                failure_reason="Prefill bootstrap failed" if failed else None,
+            )
 
     def _handle_bootstrap_message(self, msg: List[bytes]) -> bool:
         if self.deferred_bootstrap is None or not msg:
@@ -620,12 +621,15 @@ class CommonKVManager(BaseKVManager):
         try:
             room = int(msg[1])
             endpoint = (msg[2].decode("ascii"), int(msg[3]))
+            # Decode receivers mapped onto this rank; absent from senders that
+            # predate attention TP > 1 on decode.
+            expected = int(msg[4]) if len(msg) > 4 else 1
         except (IndexError, ValueError, UnicodeDecodeError):
             logger.warning("Dropping malformed bootstrap control message")
             return True
         if msg[0] == b"BOOTSTRAP":
             self._notify_bootstrap(
-                room, self.deferred_bootstrap.register(room, endpoint)
+                room, self.deferred_bootstrap.register(room, endpoint, expected)
             )
             return True
         # Retain cancellation even if it beats source creation. Let the backend
@@ -2157,7 +2161,7 @@ class CommonKVSender(BaseKVSender):
         return KVPoll.Failed
 
     def clear(self) -> None:
-        notification = None
+        notification = []
         if self.kv_mgr.deferred_bootstrap is not None:
             if not self._owns_bootstrap_room:
                 return
@@ -2174,14 +2178,15 @@ class CommonKVSender(BaseKVSender):
         # A sender can be cleared while a counted transfer is still writing:
         # keep the target for the worker, or ACK now if nothing is in flight.
         self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
-        if notification is not None:
-            endpoint, failed = notification
-            self.kv_mgr.send_kv_status_message(
-                targets=[endpoint],
-                bootstrap_room=self.bootstrap_room,
-                status=KVPoll.Failed if failed else KVPoll.Success,
-                failure_reason="Prefill bootstrap failed" if failed else None,
-            )
+        for failed in (True, False):
+            targets = [endpoint for endpoint, f in notification if f is failed]
+            if targets:
+                self.kv_mgr.send_kv_status_message(
+                    targets=targets,
+                    bootstrap_room=self.bootstrap_room,
+                    status=KVPoll.Failed if failed else KVPoll.Success,
+                    failure_reason="Prefill bootstrap failed" if failed else None,
+                )
 
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
@@ -2258,9 +2263,11 @@ class CommonKVReceiver(BaseKVReceiver):
                 "Set --disaggregation-decode-allocation-policy identically on both roles."
             )
         elif policy == "prefill_complete" and (
-            info.attn_tp_size != 1 or info.attn_cp_size != 1 or info.pp_size != 1
+            info.attn_tp_size != 1 or info.attn_cp_size != 1
         ):
-            reason = "prefill_complete requires peer attention TP1/CP1/PP1"
+            # Pipeline stages are fine: each stage signals readiness for its own
+            # layers, and any one of them lets decode publish destinations.
+            reason = "prefill_complete requires peer attention TP1/CP1"
         if reason is not None:
             self.kv_mgr.record_failure(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
@@ -2303,6 +2310,9 @@ class CommonKVReceiver(BaseKVReceiver):
                             str(self.bootstrap_room).encode("ascii"),
                             self.kv_mgr.local_ip.encode("ascii"),
                             str(self.kv_mgr.rank_port).encode("ascii"),
+                            # Decode ranks mapped onto each prefill rank; the
+                            # prefill notifies every one of them.
+                            str(self.required_dst_info_num).encode("ascii"),
                         ]
                     )
         except zmq.ZMQError:

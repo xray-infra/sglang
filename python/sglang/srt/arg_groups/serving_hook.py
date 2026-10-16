@@ -481,7 +481,13 @@ def handle_other_validations(server_args: Any):
 
     # Handle optimistic prefill validation
     if cfg.optimistic_prefill_attempts > 0 and cfg.disaggregation_mode == "prefill":
-        if cfg.pp_size > 1:
+        if (
+            cfg.pp_size > 1
+            and cfg.disaggregation_decode_allocation_policy != "prefill_complete"
+        ):
+            # Yielding a parked or chunked request is a per-stage decision.
+            # prefill_complete never yields, and the PP loop concludes
+            # bootstrap failures only on PP consensus.
             logger.warning("Optimistic prefill does not support pp_size > 1")
             declare_resolution(
                 server_args,

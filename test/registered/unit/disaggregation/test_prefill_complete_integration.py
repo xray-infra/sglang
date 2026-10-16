@@ -64,12 +64,31 @@ class TestAllocationConfiguration(CustomTestCase):
                 handle_pd_disaggregation(args)
                 self.assertEqual(resolving_view(args).optimistic_prefill_attempts, 1)
 
+    def test_pipeline_prefill_and_tp_dcp_decode_are_supported(self):
+        # PP8 x TP1 prefill feeding a TP8 x DCP4 decode.
+        prefill = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_decode_allocation_policy="prefill_complete",
+            pp_size=8,
+        )
+        handle_pd_disaggregation(prefill)
+        self.assertEqual(resolving_view(prefill).optimistic_prefill_attempts, 1)
+        decode = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_allocation_policy="prefill_complete",
+            tp_size=8,
+            dcp_size=4,
+        )
+        handle_pd_disaggregation(decode)
+
     def test_unsupported_modes_fail_explicitly(self):
         combinations = [
             {"disaggregation_mode": "null"},
             {"disaggregation_transfer_backend": "nixl"},
             {"tp_size": 2},
-            {"pp_size": 2},
+            {"disaggregation_mode": "decode", "pp_size": 2},
             {"attn_cp_size": 2},
             {"dcp_size": 2},
             {"enable_hisparse": True},
@@ -661,6 +680,177 @@ class TestAllocationIntegration(CustomTestCase):
 
             scheduler.process_disagg_prefill_inflight_queue()
             scheduler.optimistic_release_and_requeue.assert_called_once_with(reqs[0])
+
+    def test_tp8_decode_receivers_all_learn_readiness_and_success(self):
+        """Decode attention TP8 over a TP1 pipeline-stage prefill rank."""
+        decodes = {10 + i: self.manager("decode", 10 + i) for i in range(8)}
+
+        def receiver_for(mgr):
+            receiver = MooncakeKVReceiver(mgr, "prefill:8998", 1)
+            receiver.bootstrap_infos = [{"rank_ip": "prefill", "rank_port": 1}]
+            mgr.prefill_info_table = {
+                receiver.bootstrap_addr: PrefillServerInfo(
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                    dp_size=1,
+                    pp_size=8,
+                    page_size=1,
+                    kv_cache_dtype=None,
+                    follow_bootstrap_room=True,
+                    decode_allocation_policy="prefill_complete",
+                    target_tp_rank=0,
+                    target_tp_ranks=[0],
+                    target_cp_ranks=[0],
+                    target_pp_ranks=[0],
+                    required_dst_info_num=8,
+                    required_prefill_response_num=1,
+                )
+            }
+            sock = SimpleNamespace(
+                send_multipart=lambda msg: self.wire.append(("tcp://prefill:1", msg))
+            )
+            receiver._connect_to_bootstrap_server = Mock(
+                return_value=(sock, threading.Lock())
+            )
+            with patch.object(receiver, "_setup_bootstrap_infos"):
+                receiver.init(0)
+            return receiver
+
+        def flush():
+            while self.wire:
+                endpoint, msg = self.wire.popleft()
+                if endpoint == "tcp://prefill:1":
+                    self.prefill._handle_bootstrap_message(msg)
+                    continue
+                mgr = decodes[int(endpoint.rsplit(":", 1)[1])]
+                room, status, rank, reason = mgr.parse_kv_status_message(msg)
+                mgr.apply_prefill_status(
+                    bootstrap_room=room,
+                    status=status,
+                    prefill_rank=rank,
+                    failure_reason=reason,
+                )
+
+        sender = self.sender()
+        receivers = [receiver_for(mgr) for mgr in decodes.values()]
+        flush()
+        for receiver in receivers:
+            self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
+        sender.mark_prefill_complete()
+        flush()
+        for receiver in receivers:
+            self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+
+        # A ninth receiver for the room fails closed and leaves the eight alone.
+        decodes[99] = self.manager("decode", 99)
+        extra = receiver_for(decodes[99])
+        flush()
+        self.assertEqual(extra.poll(), KVPoll.Failed)
+        self.assertEqual(len(self.prefill.deferred_bootstrap.rooms[1].endpoints), 8)
+
+        self.prefill.conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+        sender.clear()
+        flush()
+        for receiver in receivers:
+            self.assertEqual(receiver.poll(), KVPoll.Success)
+
+    def test_pp_parked_prefill_sends_locally_and_fails_only_on_consensus(self):
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        req = SimpleNamespace(
+            rid="parked",
+            disagg_kv_sender=sender,
+            pending_bootstrap=True,
+            prefill_attempt_count=1,
+            skip_radix_cache_insert=False,
+        )
+        scheduler = self.inflight_scheduler([req])
+        scheduler.checkpoint_disagg_prefill = Mock()
+
+        def finalize(r):
+            r.pending_bootstrap = False
+            return True
+
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            finalize_bootstrap=Mock(side_effect=finalize)
+        )
+        # Still bootstrapping: kept, nothing sent, even if listed.
+        self.assertEqual(
+            scheduler.process_disagg_prefill_inflight_queue(["parked"]), []
+        )
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+        scheduler.send_kv_chunk.assert_not_called()
+        # Destinations reached this stage: finalize and send without a consensus
+        # round, and without touching the radix tree again.
+        self.prefill.update_status(1, KVPoll.WaitingForInput)
+        self.assertEqual(scheduler.process_disagg_prefill_inflight_queue([]), [])
+        scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=True)
+        scheduler.checkpoint_disagg_prefill.assert_not_called()
+        self.assertFalse(req.pending_bootstrap)
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+
+        failed_sender = self.sender(room=2)
+        failed_sender.abort()
+        failed = SimpleNamespace(
+            rid="failed",
+            disagg_kv_sender=failed_sender,
+            pending_bootstrap=True,
+            finished_reason=None,
+            time_stats=Mock(),
+            metadata_buffer_index=-1,
+            return_logprob=False,
+            bootstrap_host="prefill",
+        )
+        scheduler = self.inflight_scheduler([failed])
+        scheduler.disagg_prefill_pending_chunk_rids = {"failed"}
+        scheduler.req_to_metadata_buffer_idx_allocator = Mock()
+
+        def conclude(r):
+            # Same release as any failed transfer (checkpointed, like Success).
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            r.finished_reason = FINISH_ABORT("failed")
+
+        scheduler.handle_inflight_transfer_failure = Mock(side_effect=conclude)
+        scheduler.handle_bootstrap_failure = Mock()
+        # A failure seen only by this stage releases nothing.
+        self.assertEqual(scheduler.process_disagg_prefill_inflight_queue([]), [])
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [failed])
+        scheduler.handle_inflight_transfer_failure.assert_not_called()
+        # On consensus it concludes like a failed transfer.
+        self.assertEqual(
+            scheduler.process_disagg_prefill_inflight_queue(["failed"]), [failed]
+        )
+        scheduler.handle_inflight_transfer_failure.assert_called_once_with(failed)
+        scheduler.handle_bootstrap_failure.assert_not_called()
+        self.assertFalse(failed.pending_bootstrap)
+        self.assertEqual(scheduler.disagg_prefill_pending_chunk_rids, set())
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
+
+    def test_pp_chunked_prefill_does_not_poll_bootstrap_per_stage(self):
+        req = Mock(finished_reason=None, to_finish=None, pending_bootstrap=True)
+        scheduler = SimpleNamespace(
+            chunked_req=req,
+            tree_cache=Mock(),
+            enable_overlap=False,
+            check_bootstrap=Mock(return_value=False),
+            send_kv_chunk=Mock(),
+        )
+        scheduler.checkpoint_disagg_prefill = Mock()
+        running = SimpleNamespace(batch_is_full=True)
+        with patch(
+            "sglang.srt.disaggregation.prefill.get_parallel",
+            return_value=SimpleNamespace(pp_size=8),
+        ):
+            SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+                scheduler, None, running
+            )
+        scheduler.check_bootstrap.assert_not_called()
+        scheduler.send_kv_chunk.assert_not_called()
+        self.assertIs(scheduler.chunked_req, req)
+        self.assertFalse(running.batch_is_full)
 
     def test_clear_before_allocation_notifies_prefill(self):
         sender, receiver = self.sender(), self.receiver()
