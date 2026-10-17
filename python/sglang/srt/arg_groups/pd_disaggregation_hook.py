@@ -227,10 +227,10 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         unsupported.append("HiSparse")
     if cfg.disaggregation_decode_host_receive_threshold < 1:
         unsupported.append("decode host KV buffering")
-    if cfg.disaggregation_mode == "decode" and (
-        cfg.disaggregation_decode_enable_radix_cache or cfg.enable_hierarchical_cache
-    ):
-        unsupported.append("decode radix cache or decode HiCache")
+    # Decode radix cache is supported: decode matches its prefix when it
+    # allocates (after prefill completes) and sends it as decode_prefix_len.
+    if cfg.disaggregation_mode == "decode" and cfg.enable_hierarchical_cache:
+        unsupported.append("decode HiCache")
     if (
         cfg.disaggregation_mode == "prefill"
         and cfg.enable_hierarchical_cache

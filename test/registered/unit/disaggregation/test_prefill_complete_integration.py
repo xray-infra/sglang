@@ -83,6 +83,18 @@ class TestAllocationConfiguration(CustomTestCase):
         )
         handle_pd_disaggregation(decode)
 
+    def test_decode_radix_cache_is_supported(self):
+        args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_allocation_policy="prefill_complete",
+            disaggregation_decode_enable_radix_cache=True,
+            tp_size=8,
+            dcp_size=4,
+        )
+        handle_pd_disaggregation(args)
+        self.assertFalse(resolving_view(args).disable_radix_cache)
+
     def test_unsupported_modes_fail_explicitly(self):
         combinations = [
             {"disaggregation_mode": "null"},
@@ -103,10 +115,7 @@ class TestAllocationConfiguration(CustomTestCase):
                 "enable_hierarchical_cache": True,
                 "hicache_write_policy": "write_through",
             },
-            {
-                "disaggregation_mode": "decode",
-                "disaggregation_decode_enable_radix_cache": True,
-            },
+            {"disaggregation_mode": "decode", "enable_hierarchical_cache": True},
         ]
         for changed in combinations:
             with self.subTest(changed=changed):
