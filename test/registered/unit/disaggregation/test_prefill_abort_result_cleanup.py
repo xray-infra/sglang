@@ -41,6 +41,7 @@ class _Req:
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
+        self.pp_early_kv_send = False
         self.output_ids = []
         self.origin_input_ids = list(range(100))
         self.extend_end = None
