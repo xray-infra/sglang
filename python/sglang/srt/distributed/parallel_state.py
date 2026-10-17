@@ -131,6 +131,24 @@ class P2PWork:
     payload: Optional[torch.Tensor]
 
 
+def _host_nested_tensors(value: Any) -> Any:
+    """Copy device tensors nested in a metadata value to host.
+
+    Metadata is pickled. A pickled CUDA tensor carries its device index and is
+    restored onto that device by the receiver, which creates a context on a
+    GPU owned by another rank (and fails with OOM when that GPU is full).
+    """
+    if isinstance(value, torch.Tensor):
+        return value if value.is_cpu else value.cpu()
+    if type(value) is list:
+        return [_host_nested_tensors(v) for v in value]
+    if type(value) is tuple:
+        return tuple(_host_nested_tensors(v) for v in value)
+    if type(value) is dict:
+        return {k: _host_nested_tensors(v) for k, v in value.items()}
+    return value
+
+
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
@@ -153,7 +171,7 @@ def _split_tensor_dict(
             )
             tensor_list.append(value)
         else:
-            metadata_list.append((key, value))
+            metadata_list.append((key, _host_nested_tensors(value)))
     return metadata_list, tensor_list
 
 
