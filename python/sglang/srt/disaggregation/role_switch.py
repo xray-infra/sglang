@@ -238,6 +238,7 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
                 km.teardown()
             scheduler.disagg_prefill_bootstrap_queue = None
         scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_pp_early_kv_reqs = []
     elif mode == DisaggregationMode.DECODE:
         q = getattr(scheduler, "disagg_decode_prealloc_queue", None)
         if q is not None:

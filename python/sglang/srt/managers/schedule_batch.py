@@ -1401,6 +1401,9 @@ class Req(ReqDllmMixin):
         # At-rest device-resident prefix end, snapshotted on the request's
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
+        # PP disagg prefill: each stage sends its KV once its forward of the
+        # final chunk completes (SGLANG_DISAGGREGATION_PP_EARLY_KV_SEND).
+        self.pp_early_kv_send = False
         self.metadata_buffer_index: int = -1
         self.expected_kv_checksum: int = 0
         # Used in overlap sequence to signal that an optimistic request should
