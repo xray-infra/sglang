@@ -484,3 +484,30 @@ if __name__ == "__main__":
 
         traceback.print_exc()
         sys.exit(1)
+
+
+def test_split_tensor_dict_copies_nested_device_tensors_to_host():
+    from sglang.srt.distributed.parallel_state import _split_tensor_dict
+
+    # A nested CUDA tensor would be pickled with its device index; the receiver
+    # would then restore it onto the sender's GPU.
+    device_tensor = Mock(spec=torch.Tensor, is_cpu=False)
+    host_copy = torch.tensor([0.5])
+    device_tensor.cpu.return_value = host_copy
+    top = torch.tensor([1, 2])
+    nested_host = torch.tensor([3.0])
+    metadata, tensors = _split_tensor_dict(
+        {
+            "next_token_ids": top,
+            "top_logprobs_val": [device_tensor, [nested_host], None],
+            "pair": (device_tensor, 7),
+            "extend_input_len_per_req": [4096, 12],
+        }
+    )
+    assert tensors == [top]
+    values = dict(metadata)
+    assert values["top_logprobs_val"][0] is host_copy
+    assert values["top_logprobs_val"][1][0] is nested_host
+    assert values["top_logprobs_val"][2] is None
+    assert values["pair"] == (host_copy, 7)
+    assert values["extend_input_len_per_req"] == [4096, 12]
