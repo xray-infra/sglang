@@ -1010,7 +1010,10 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
-                self.checkpoint_disagg_prefill(req, as_pending=req.pp_early_kv_send)
+                if req.pp_early_kv_send:
+                    self.checkpoint_disagg_prefill(req, as_pending=True)
+                else:
+                    self.checkpoint_disagg_prefill(req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
