@@ -24,8 +24,9 @@ import logging
 import time
 from array import array
 from collections import deque
+from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -122,6 +123,19 @@ def should_force_retry(req: Req) -> bool:
 
     digest = hashlib.sha256(str(req.rid).encode()).digest()
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
+
+
+@dataclass
+class PPEarlyKVSend:
+    """A request whose final chunk this PP stage launched (see
+    register_pp_early_kv_send)."""
+
+    req: Req
+    # Recorded on the forward stream after this stage's forward of the final
+    # chunk and, on the last stage, after the aux rows were copied to host.
+    ready: torch.cuda.Event
+    # Last stage only: host copies of the sampled token and draft state.
+    aux: Optional[Dict[str, torch.Tensor]] = None
 
 
 def _uses_write_through_cache(cache: object) -> bool:
@@ -561,11 +575,20 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
-    def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
+    def checkpoint_disagg_prefill(
+        self: Scheduler, req: Req, *, as_pending: bool = False
+    ) -> None:
+        """as_pending: checkpoint as a request still waiting for bootstrap,
+        whatever its local state. A PP early KV send finalizes bootstrap at a
+        per-stage moment, so its batch result must not branch on that state."""
         cache = self.tree_cache
-        if req.pending_bootstrap and _uses_write_through_cache(cache):
+        if (req.pending_bootstrap or as_pending) and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
             req.prefix_len = req.extend_end
+            return
+        if as_pending:
+            # Publishing now could replace pages an early KV send is still
+            # reading; the request publishes on release instead.
             return
 
         checkpoint_kv_cache(req, cache)
@@ -987,7 +1010,7 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
-                self.checkpoint_disagg_prefill(req)
+                self.checkpoint_disagg_prefill(req, as_pending=req.pp_early_kv_send)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -1026,7 +1049,9 @@ class SchedulerDisaggregationPrefillMixin:
                     == "prefill_complete"
                 ):
                     req.disagg_kv_sender.mark_prefill_complete()
-                if not req.pending_bootstrap:
+                # An early-send request that finalized bootstrap has already
+                # sent its last chunk on this stage.
+                if not req.pending_bootstrap and not req.pp_early_kv_send:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
@@ -1103,6 +1128,148 @@ class SchedulerDisaggregationPrefillMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
         self.maybe_send_health_check_signal()
+
+    def pp_early_kv_send_enabled(self: Scheduler) -> bool:
+        """PP + prefill_complete: send each stage's KV when that stage's forward
+        of the final chunk completes, not when the pipeline loop processes the
+        batch result pp_size - 1 iterations later.
+
+        Polls and finalizes per stage without an attention TP/CP all-reduce on
+        readiness, so it needs single-rank attention groups.
+        """
+        parallel = get_parallel()
+        return (
+            envs.SGLANG_DISAGGREGATION_PP_EARLY_KV_SEND.get()
+            and parallel.pp_size > 1
+            and parallel.attn_tp_size == 1
+            and parallel.attn_cp_size == 1
+            and get_disagg().disaggregation_decode_allocation_policy
+            == "prefill_complete"
+            and self.transfer_backend == TransferBackend.MOONCAKE
+            and not self.enable_staging
+            and self.kv_checksum_computer is None
+            and getattr(self.tree_cache, "linker", None) is None
+        )
+
+    def register_pp_early_kv_send(
+        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        """Called right after this stage launched `batch`.
+
+        Every stage sees the same batch, so the per-request decision
+        (req.pp_early_kv_send) is identical across stages; the batch result
+        branches only on it. Readiness (decode destinations, forward done) is
+        per stage and only decides when this stage sends.
+        """
+        if not batch.forward_mode.is_extend() or not self.pp_early_kv_send_enabled():
+            return
+        rows = [
+            i
+            for i, req in enumerate(batch.reqs)
+            if req is not self.chunked_req
+            and not (
+                # Their aux needs the full batch result, or a later check may
+                # still abort after the token was sent.
+                req.return_logprob
+                or req.return_sampling_mask
+                or req.grammar is not None
+                or req.bootstrap_host == FAKE_BOOTSTRAP_HOST
+                or is_aborted(req)
+            )
+        ]
+        if not rows:
+            return
+        aux_rows = None
+        with self.forward_stream_ctx:
+            if self.pp_group.is_last_rank:
+                aux_rows = self._pp_copy_early_kv_aux(result)
+            ready = self.device_module.Event()
+            ready.record(self.device_module.current_stream())
+        for i in rows:
+            req = batch.reqs[i]
+            req.pp_early_kv_send = True
+            # Decode allocates now and publishes destinations while the rest
+            # of the pipeline computes.
+            req.disagg_kv_sender.mark_prefill_complete()
+            aux = None
+            if aux_rows is not None:
+                aux = {k: v[i] for k, v in aux_rows.items()}
+            self.disagg_pp_early_kv_reqs.append(PPEarlyKVSend(req, ready, aux))
+
+    def _pp_copy_early_kv_aux(
+        self: Scheduler, result: GenerationBatchResult
+    ) -> Dict[str, torch.Tensor]:
+        # Stream-ordered copies: the sources may be reused by the next forward.
+        src = {"next_token_ids": result.next_token_ids}
+        draft_input = result.next_draft_input
+        if (
+            self.spec_algorithm.is_eagle()
+            and draft_input is not None
+            and draft_input.topk_p is not None
+        ):
+            src["topk_p"] = draft_input.topk_p
+            src["topk_index"] = draft_input.topk_index
+            src["hidden_states"] = draft_input.hidden_states
+            if draft_input.dsa_topk_indices is not None:
+                src["dsa_topk_indices"] = draft_input.dsa_topk_indices
+        out = {}
+        for name, t in src.items():
+            host = torch.empty(t.shape, dtype=t.dtype, pin_memory=t.is_cuda)
+            host.copy_(t, non_blocking=True)
+            out[name] = host
+        return out
+
+    def process_pp_early_kv_send(self: Scheduler) -> None:
+        """Send this stage's last chunk for registered requests whose decode
+        destinations arrived. Failures still conclude on PP consensus in the
+        inflight queue."""
+        if not self.disagg_pp_early_kv_reqs:
+            return
+        # Finalized elsewhere (inflight queue), retired or aborted: the
+        # inflight queue concludes it.
+        entries = [
+            e
+            for e in self.disagg_pp_early_kv_reqs
+            if e.req.pending_bootstrap and not is_aborted(e.req)
+        ]
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [e.req.disagg_kv_sender for e in entries],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        keep: List[PPEarlyKVSend] = []
+        for e, poll in zip(entries, polls):
+            req = e.req
+            if poll != KVPoll.WaitingForInput:
+                keep.append(e)
+                continue
+            result_done = len(req.output_ids) > 0
+            if not result_done and e.aux is not None and not e.ready.query():
+                keep.append(e)
+                continue
+            if not self.handle_pending_bootstrap(req, poll, checkpoint=False):
+                keep.append(e)
+                continue
+            if result_done:
+                # The batch result is in: a regular last-chunk send.
+                self.send_kv_chunk(req, last_chunk=True)
+                continue
+            # The transfer worker waits for this stage's forward before reading.
+            req.disagg_kv_sender._early_send_wait_event = e.ready
+            if e.aux is None:
+                self.send_kv_chunk(req, last_chunk=True, skip_aux=True)
+                continue
+            if "topk_p" in e.aux:
+                req.output_topk_p = e.aux["topk_p"]
+                req.output_topk_index = e.aux["topk_index"]
+                req.hidden_states_tensor = e.aux["hidden_states"]
+                req.output_dsa_topk_indices = e.aux.get("dsa_topk_indices")
+            self.send_kv_chunk(
+                req,
+                last_chunk=True,
+                first_token_id=int(e.aux["next_token_ids"]),
+            )
+        self.disagg_pp_early_kv_reqs = keep
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
@@ -1498,7 +1665,13 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        *,
+        first_token_id: Optional[int] = None,
+        skip_aux: bool = False,
     ) -> None:
+        """first_token_id / skip_aux: a PP early KV send, before the batch
+        result exists. The last stage passes the sampled token; other stages
+        send KV only (aux comes from the last stage)."""
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):
@@ -1510,13 +1683,21 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = state_indices_for_request(self, req, end_idx)
                 value = computer.compute(page_indices_gpu, state_indices)
             self.disagg_metadata_buffers.set_kv_checksum(req, value)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        self._send_kv_chunk(
+            req,
+            last_chunk=last_chunk,
+            end_idx=end_idx,
+            first_token_id=first_token_id,
+            skip_aux=skip_aux,
+        )
 
     def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        first_token_id: Optional[int] = None,
+        skip_aux: bool = False,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -1552,7 +1733,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            if not skip_aux:
+                self.disagg_metadata_buffers.set_buf(req, first_token_id)
+            req.disagg_kv_sender.skip_aux = skip_aux
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
@@ -1726,7 +1909,8 @@ class SchedulerDisaggregationPrefillMixin:
             )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
-        # already put the request on `disagg_prefill_inflight_queue`.
+        # already put the request on `disagg_prefill_inflight_queue`, except a
+        # PP early send, whose batch result puts it there.
         if last_chunk:
             self.disagg_prefill_pending_chunk_rids.discard(req.rid)
         else:
@@ -1760,6 +1944,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.tmp_end_idx = -1
         req.disagg_decode_prefix_len = 0
         req.early_send_prefix_end = None
+        req.pp_early_kv_send = False
         req.hidden_states_tensor = None
         req.output_dsa_topk_indices = None
         req.pending_bootstrap = True

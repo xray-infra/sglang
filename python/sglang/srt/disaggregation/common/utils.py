@@ -34,6 +34,9 @@ class TransferKVChunk:
     staging_counted: bool = False
     # Early-send: GPU event to synchronize before reading KV (optional).
     wait_event: Optional[object] = None
+    # Last chunk of a PP stage that does not own the request's aux data
+    # (only the last stage has the sampled token and draft state).
+    skip_aux: bool = False
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

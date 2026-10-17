@@ -2726,10 +2726,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     break
 
                             # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
+                            ret = (
+                                0
+                                if kv_chunk.skip_aux
+                                else self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                )
                             )
                             if ret != 0:
                                 # The aux write targets decode's metadata
@@ -3037,6 +3041,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
         wait_event: Optional[object] = None,
+        skip_aux: bool = False,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -3077,6 +3082,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
+                skip_aux=skip_aux,
             )
         )
 
@@ -3201,6 +3207,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 wait_event=wait_event,
+                skip_aux=getattr(self, "skip_aux", False),
             )
         self._record_transfer_indices(kv_indices, state_indices)
 

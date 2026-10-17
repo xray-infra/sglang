@@ -535,9 +535,12 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
-    def set_buf(self, req: Req):
-
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+    def set_buf(self, req: Req, first_token_id: Optional[int] = None):
+        # first_token_id: the sampled token, when it is sent before the batch
+        # result appends it to req.output_ids (PP early KV send).
+        self.output_ids[req.metadata_buffer_index][0] = (
+            req.output_ids[0] if first_token_id is None else first_token_id
+        )
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.

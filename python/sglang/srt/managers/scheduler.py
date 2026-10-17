@@ -89,6 +89,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
 from sglang.srt.disaggregation.prefill import (
+    PPEarlyKVSend,
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
@@ -1591,6 +1592,9 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
             # Requests with a sent chunk that are not yet on the inflight queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
+            # PP: requests whose final chunk this stage launched and whose KV
+            # waits for decode destinations (register_pp_early_kv_send).
+            self.disagg_pp_early_kv_reqs: List[PPEarlyKVSend] = []
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 

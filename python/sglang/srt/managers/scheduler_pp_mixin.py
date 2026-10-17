@@ -272,6 +272,7 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
+                self.process_pp_early_kv_send()
                 self.process_bootstrapped_queue()
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
@@ -318,6 +319,10 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    self.register_pp_early_kv_send(cur_batch, result)
+                # Before the blocking relay/release receives below, which
+                # serialize this stage behind the previous one.
+                self.process_pp_early_kv_send()
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
